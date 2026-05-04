@@ -1,0 +1,22 @@
+# ─── Web Framework ────────────────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0          # ASGI server with websocket support
+
+# ─── MQTT ─────────────────────────────────────────────────────────────────────
+paho-mqtt==1.6.1                   # Industry-standard MQTT client
+
+# ─── Authentication ───────────────────────────────────────────────────────────
+PyJWT==2.8.0
+passlib[bcrypt]==1.7.4             # Password hashing
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+sqlalchemy==2.0.30                 # ORM (SQLite for demo → swap to Postgres/Timescale)
+aiosqlite==0.20.0                  # Async SQLite driver
+
+# ─── Validation & Settings ────────────────────────────────────────────────────
+pydantic==2.7.1
+pydantic-settings==2.2.1           # .env config management
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+python-multipart==0.0.9            # Form data support
