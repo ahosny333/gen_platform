@@ -11,11 +11,12 @@ Does three things:
      PostgreSQL if they don't exist yet. Safe to run multiple times
      (uses CREATE IF NOT EXISTS under the hood).
 
-  2. SEED ADMIN USER — if no users exist yet, creates the first
-     admin account so you can immediately log in on first run.
-     Credentials come from .env (or fallback defaults for dev).
+  2. Seeds 3 default accounts on first run:
+    root  → root@generator.local  / root123   (super admin)
+    admin → admin@generator.local / admin123  (internal user)
+    user  → user@generator.local  / user123   (demo customer)
 
-  3. SEED DEVICES   — creates 2 demo generator devices on first run
+  3. Also seeds 2 demo devices assigned to demo customer.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -51,7 +52,7 @@ async def create_tables() -> None:
     logger.info("[DB] Tables created successfully")
 
 
-async def seed_admin_user() -> None:
+async def seed_users() -> None:
     """
     Create the first admin user if no users exist in the database.
 
@@ -63,29 +64,43 @@ async def seed_admin_user() -> None:
         result = await session.execute(select(User).limit(1))
         existing_user = result.scalar_one_or_none()
 
-        if existing_user:
-            logger.info("[DB] Users already exist — skipping seed")
-            return
+        default_users = [
+            User(
+                id="root_01",
+                email="root@gmail.com",
+                hashed_password=hash_password("root123"),
+                full_name="Super Administrator",
+                role="root",
+                is_active=True,
+            ),
+            User(
+                id="admin_01",
+                email="admin@gmail.com",
+                hashed_password=hash_password("admin123"),
+                full_name="Platform Admin",
+                role="admin",
+                is_active=True,
+            ),
+            User(
+                id="user_01",
+                email="user@gmail.com",
+                hashed_password=hash_password("user123"),
+                full_name="Demo Customer",
+                role="user",
+                is_active=True,
+            ),
+        ]
 
-        # No users found → create default admin
-        admin = User(
-            id="user_02",
-            email="admin@gmail.com",
-            hashed_password=hash_password("admin123"),  # Change in production!
-            full_name="Platform Admin",
-            role="admin",
-            is_active=True,
-        )
-
-        session.add(admin)
+        for u in default_users:
+            session.add(u)
         await session.commit()
 
         logger.info("=" * 55)
-        logger.info("[DB] ✅ Default admin user created:")
-        logger.info("[DB]    Email:    admin@gmail.com")
-        logger.info("[DB]    Password: admin123")
-        logger.info("[DB]    Role:     admin")
-        logger.info("[DB] ⚠️  Change this password after first login!")
+        logger.info("[DB] Default users created:")
+        logger.info("[DB]   root@generator.local  / root123  (root)")
+        logger.info("[DB]   admin@generator.local / admin123 (admin)")
+        logger.info("[DB]   user@generator.local  / user123  (user)")
+        logger.info("[DB] Change all passwords before production!")
         logger.info("=" * 55)
 
 async def seed_demo_devices() -> None:
@@ -109,7 +124,7 @@ async def seed_demo_devices() -> None:
                 name="Generator 1 - Site A",
                 description="Main backup generator",
                 location="Building A - Basement",
-                owner_user_id=None,   # NULL = visible to all admins
+                owner_user_id=None,   # No owner = admin/root only
                 is_active=True,
             ),
             Device(
@@ -117,7 +132,7 @@ async def seed_demo_devices() -> None:
                 name="Generator 2 - Site B",
                 description="Secondary generator",
                 location="Building B - Rooftop",
-                owner_user_id=None,
+                owner_user_id=None,    # No owner = admin/root only
                 is_active=True,
             ),
         ]
@@ -136,5 +151,5 @@ async def init_db() -> None:
     Runs table creation then user seeding in order.
     """
     await create_tables()
-    await seed_admin_user()
+    await seed_users()
     await seed_demo_devices()

@@ -7,12 +7,20 @@ FastAPI Application Entry Point
 Startup sequence:
   1. FastAPI app is created with lifespan context manager
   2. On startup:  MQTT service connects + background loop starts
-  3. Routes are registered (auth, devices, websocket, health)
-  4. Uvicorn serves the app
-  5. On shutdown: MQTT service disconnects cleanly
+  3. Data router starts (queue → database background task)
+  4. Routes are registered (auth, devices, websocket, health)
+  5. Uvicorn serves the app
+  6. On shutdown: MQTT service disconnects cleanly
 
 The lifespan pattern (replacing deprecated @app.on_event) is the
 FastAPI-recommended approach for managing background services.
+
+Role-based route access summary:
+  /api/auth/       → public (no auth)
+  /api/devices/    → all authenticated users (filtered by role)
+  /api/users/      → root only
+  /api/admin/      → root only
+  /api/devices/{id}/command → admin + root only (Step 5)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -20,13 +28,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
 from app.core.logging import logger
+from app.core.state import shared_state
 from app.services.mqtt_service import mqtt_service
-from app.services.data_router import data_router          # ← NEW step3
-from app.db.init_db import init_db                    # ← NEW: DB init
-
+from app.services.data_router import data_router
+from app.db.init_db import init_db
 settings = get_settings()
 
 
@@ -106,8 +115,6 @@ app.add_middleware(
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Health Check (no auth required) ──────────────────────────────────────────
-from fastapi.responses import JSONResponse
-from app.core.state import shared_state
 
 
 @app.get("/health", tags=["System"], summary="Platform health check")
@@ -130,9 +137,13 @@ async def health_check():
 # ── Future route registrations (Steps 2–5) ───────────────────────────────────
 from app.api.routes import auth                                  # ← NEW Step 2
 from app.api.routes import devices                               # ← NEW Step 3
+from app.api.routes import users    # ← NEW root-only user management
+from app.api.routes import admin    # ← NEW root-only device management
 
 app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
 app.include_router(devices.router, prefix="/api/devices", tags=["Devices"])  # ← NEW
+app.include_router(users.router,   prefix="/api/users",   tags=["User Management (Root)"])
+app.include_router(admin.router,   prefix="/api/admin",   tags=["Admin Management (Root)"])
 
 # from app.api.routes import auth, devices, websocket, commands
 # app.include_router(auth.router,     prefix="/api/auth",    tags=["Auth"])

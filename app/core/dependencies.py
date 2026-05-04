@@ -12,6 +12,28 @@ Think of them like Flask's @login_required decorator — but more flexible:
   - They can return values (the current user) to the route handler
   - They can raise HTTP exceptions to block access
 
+Three roles in the platform:
+
+  root   → super admin — manages users and devices
+           Can do everything admin can + user/device management
+           This is the "management page" role
+
+  admin  → internal company user — monitors and controls generators
+           Can send Start/Stop commands, view all devices
+           Cannot manage users or create devices
+
+  user   → external customer — view only
+           Can only see their assigned devices
+           Cannot send commands
+
+Role hierarchy:
+  root > admin > user
+
+Dependencies (used as Depends() in route handlers):
+  require_auth   → any authenticated user (all 3 roles)
+  require_admin  → admin OR root
+  require_root   → root ONLY
+
 Usage in any route:
     from app.core.dependencies import require_auth, require_admin
 
@@ -59,6 +81,10 @@ async def require_auth(
 
     If anything fails → raises HTTP 401 (Unauthorized)
     The route handler never runs if this raises.
+
+    Verifies JWT token and returns the current user.
+    Raises HTTP 401 if token is missing, invalid, or expired.
+    Used on all protected endpoints.
     """
 
     # ── Check header exists ────────────────────────────────────────────────────
@@ -108,9 +134,14 @@ async def require_admin(
     Builds on top of require_auth — first authenticates, then checks role.
 
     Used for control commands (Start/Stop) — only admins can send these.
+
+    Requires role = admin OR root.
+    Both can:
+      - Send Start/Stop/Mode commands to generators
+      - Access all monitoring data and history
     External customers (role="user") will get HTTP 403 Forbidden.
     """
-    if current_user.role != "admin":
+    if current_user.role not in ("admin", "root"):
         logger.warning(
             f"[Auth] Access denied — user {current_user.id} "
             f"(role={current_user.role}) attempted admin action"
@@ -120,3 +151,39 @@ async def require_admin(
             detail={"error": "Admin access required for this action"},
         )
     return current_user
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# require_root — root ONLY
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def require_root(
+    current_user: User = Depends(require_auth),
+) -> User:
+    """
+    Requires role = root ONLY — the super administrator.
+
+    Root exclusively can:
+      - Create / edit / deactivate users
+      - Create / edit / deactivate devices
+      - Assign devices to customer accounts
+      - View all users in the system
+
+    Admin and User roles both get HTTP 403 Forbidden here.
+
+    Usage in any route:
+        @router.post("/users/")
+        async def create_user(current_user = Depends(require_root)):
+            # Only root reaches this line
+    """
+    if current_user.role != "root":
+        logger.warning(
+            f"[Auth] Root access denied — user={current_user.id} "
+            f"role={current_user.role}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "Root access required for this action"},
+        )
+    return current_user
+
