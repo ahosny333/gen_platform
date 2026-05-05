@@ -11,12 +11,11 @@ Does three things:
      PostgreSQL if they don't exist yet. Safe to run multiple times
      (uses CREATE IF NOT EXISTS under the hood).
 
-  2. Seeds 3 default accounts on first run:
-    root  → root@generator.local  / root123   (super admin)
-    admin → admin@generator.local / admin123  (internal user)
-    user  → user@generator.local  / user123   (demo customer)
+  2. Seeds  on first run:
+    Users:   root, admin_01, user_01, user_02
+    Devices: gen_01, gen_02, gen_03
 
-  3. Also seeds 2 demo devices assigned to demo customer.
+  root sees ALL devices (bypasses junction table)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -32,6 +31,7 @@ from app.db.database import engine, Base, AsyncSessionLocal
 from app.models.user import User  # noqa: F401
 from app.models.device import Device                # noqa: F401
 from app.models.telemetry import TelemetryReading   # noqa: F401
+from app.models.user_device import UserDevice       # noqa: F401  ← NEW
 
 settings = get_settings()
 
@@ -62,48 +62,38 @@ async def seed_users() -> None:
     async with AsyncSessionLocal() as session:
         # Check if any user already exists
         result = await session.execute(select(User).limit(1))
-        existing_user = result.scalar_one_or_none()
+        if result.scalar_one_or_none():
+            logger.info("[DB] Users exist — skipping seed")
+            return
 
-        default_users = [
-            User(
-                id="root_01",
-                email="root@gmail.com",
-                hashed_password=hash_password("root123"),
-                full_name="Super Administrator",
-                role="root",
-                is_active=True,
-            ),
-            User(
-                id="admin_01",
-                email="admin@gmail.com",
-                hashed_password=hash_password("admin123"),
-                full_name="Platform Admin",
-                role="admin",
-                is_active=True,
-            ),
-            User(
-                id="user_01",
-                email="user@gmail.com",
-                hashed_password=hash_password("user123"),
-                full_name="Demo Customer",
-                role="user",
-                is_active=True,
-            ),
+        users = [
+            User(id="root_01",   email="root@gmail.com",
+                 hashed_password=hash_password("root123"),
+                 full_name="Super Administrator", role="root",  is_active=True),
+            User(id="admin_01",  email="admin@gmail.com",
+                 hashed_password=hash_password("admin123"),
+                 full_name="Platform Admin",      role="admin", is_active=True),
+            User(id="user_01",   email="customer1@gmail.com",
+                 hashed_password=hash_password("user123"),
+                 full_name="Customer One",        role="user",  is_active=True),
+            User(id="user_02",   email="customer2@gmail.com",
+                 hashed_password=hash_password("user456"),
+                 full_name="Customer Two",        role="user",  is_active=True),
         ]
-
-        for u in default_users:
+        for u in users:
             session.add(u)
         await session.commit()
 
-        logger.info("=" * 55)
+        logger.info("=" * 60)
         logger.info("[DB] Default users created:")
-        logger.info("[DB]   root@generator.local  / root123  (root)")
-        logger.info("[DB]   admin@generator.local / admin123 (admin)")
-        logger.info("[DB]   user@generator.local  / user123  (user)")
+        logger.info("[DB]   root@gmail.com       / root123  (root)")
+        logger.info("[DB]   admin@gmail.com      / admin123 (admin)")
+        logger.info("[DB]   customer1@gmail.com  / user123  (user)")
+        logger.info("[DB]   customer2@gmail.com  / user456  (user)")
         logger.info("[DB] Change all passwords before production!")
-        logger.info("=" * 55)
+        logger.info("=" * 60)
 
-async def seed_demo_devices() -> None:
+async def seed_devices() -> None:
     """
     Create 2 demo generator devices if no devices exist yet.
 
@@ -118,31 +108,59 @@ async def seed_demo_devices() -> None:
             logger.info("[DB] Devices already exist — skipping device seed")
             return
 
-        demo_devices = [
-            Device(
-                id="gen_01",
-                name="Generator 1 - Site A",
-                description="Main backup generator",
-                location="Building A - Basement",
-                owner_user_id=None,   # No owner = admin/root only
-                is_active=True,
-            ),
-            Device(
-                id="gen_02",
-                name="Generator 2 - Site B",
-                description="Secondary generator",
-                location="Building B - Rooftop",
-                owner_user_id=None,    # No owner = admin/root only
-                is_active=True,
-            ),
+        devices = [
+            Device(id="gen_01", name="Generator 1 - Site A",
+                   description="Main backup generator",
+                   location="Building A - Basement", is_active=True),
+            Device(id="gen_02", name="Generator 2 - Site B",
+                   description="Secondary generator",
+                   location="Building B - Rooftop",  is_active=True),
+            Device(id="gen_03", name="Generator 3 - Site C",
+                   description="Emergency unit",
+                   location="Building C - Ground",   is_active=True),
         ]
-
-        for device in demo_devices:
-            session.add(device)
-
+        for d in devices:
+            session.add(d)
         await session.commit()
-        logger.info("[DB] Demo devices created: gen_01, gen_02")
+        logger.info("[DB] Demo devices created: gen_01, gen_02, gen_03")
 
+async def seed_assignments() -> None:
+    """
+    Seed the user_devices junction table.
+
+    Assignment map:
+      admin_01 → gen_01, gen_02          (sees 2 devices)
+      user_01  → gen_01                  (sees 1 device)
+      user_02  → gen_01, gen_03          (sees 2 devices, shares gen_01 with others)
+      root_01  → NOT in table            (bypasses table, sees ALL)
+
+    This demonstrates:
+      - Same device (gen_01) accessible by multiple users
+      - One user (admin_01) has multiple devices
+      - root is not in this table at all
+    """
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(UserDevice).limit(1))
+        if result.scalar_one_or_none():
+            logger.info("[DB] Assignments exist — skipping seed")
+            return
+
+        assignments = [
+            UserDevice(user_id="admin_01", device_id="gen_01", assigned_by="root_01"),
+            UserDevice(user_id="admin_01", device_id="gen_02", assigned_by="root_01"),
+            UserDevice(user_id="user_01",  device_id="gen_01", assigned_by="root_01"),
+            UserDevice(user_id="user_02",  device_id="gen_01", assigned_by="root_01"),
+            UserDevice(user_id="user_02",  device_id="gen_03", assigned_by="root_01"),
+        ]
+        for a in assignments:
+            session.add(a)
+        await session.commit()
+
+        logger.info("[DB] Device assignments seeded:")
+        logger.info("[DB]   admin_01 → gen_01, gen_02")
+        logger.info("[DB]   user_01  → gen_01")
+        logger.info("[DB]   user_02  → gen_01, gen_03")
+        logger.info("[DB]   root_01  → ALL (bypasses table)")
 
 
 async def init_db() -> None:
@@ -152,4 +170,5 @@ async def init_db() -> None:
     """
     await create_tables()
     await seed_users()
-    await seed_demo_devices()
+    await seed_devices()
+    await seed_assignments()

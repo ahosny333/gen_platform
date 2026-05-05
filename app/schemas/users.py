@@ -57,6 +57,12 @@ class CreateUserRequest(BaseModel):
         example="user",
         description="Role: root | admin | user",
     )
+    # Optional: assign devices immediately on user creation
+    device_ids: List[str] = Field(
+        default=[],
+        example=["gen_01", "gen_02"],
+        description="List of device IDs to assign to this user on creation.",
+    )
 
 
 class UpdateUserRequest(BaseModel):

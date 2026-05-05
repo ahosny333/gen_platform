@@ -13,6 +13,7 @@ Design decision — NO hardcoded sensor columns:
   just update the frontend — zero database changes needed.
 
   Historical readings use the same pattern in telemetry_readings.py
+  New:  user_devices table has multiple rows per device (many users)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -57,15 +58,19 @@ class Device(Base):
         # Example: "Building A - Basement"
     )
 
-    # ── Ownership ──────────────────────────────────────────────────────────────
-    owner_user_id = Column(
-        String,
-        ForeignKey("users.id"),
-        nullable=True,
-        # Which customer this device belongs to.
-        # NULL = internal device (visible to all admins)
-        # Set to a user_id = only that customer can see it
-    )
+    # ── NOTE: No owner_user_id here anymore ───────────────────────────────────
+    # Access control is handled by the user_devices junction table.
+    # root role bypasses that table and sees all devices directly.
+
+    # # ── Ownership ──────────────────────────────────────────────────────────────
+    # owner_user_id = Column(
+    #     String,
+    #     ForeignKey("users.id"),
+    #     nullable=True,
+    #     # Which customer this device belongs to.
+    #     # NULL = internal device (visible to all admins)
+    #     # Set to a user_id = only that customer can see it
+    # )
 
     # ── Status ─────────────────────────────────────────────────────────────────
     is_active = Column(

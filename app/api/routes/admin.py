@@ -13,6 +13,16 @@ Endpoints:
   POST   /api/admin/devices/{device_id}/assign     → assign device to user
   GET    /api/admin/devices/                       → list ALL devices (incl inactive)
 
+Key change in assign endpoint:
+  Old: assign ONE user to a device
+  New: set the COMPLETE user list for a device (replaces all assignments)
+
+  POST /api/admin/devices/{device_id}/assign
+  Body: { "user_ids": ["admin_01", "user_01", "user_02"] }
+  → deletes all existing assignments for this device
+  → creates new assignments for each user_id in the list
+  → send [] to remove all assignments
+
 Note:
   Regular device reading (GET /api/devices/) is in routes/devices.py
   and is accessible to all authenticated users based on their role.
@@ -21,7 +31,7 @@ Note:
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import require_root
@@ -29,6 +39,7 @@ from app.core.logging import logger
 from app.db.database import get_db
 from app.models.device import Device
 from app.models.user import User
+from app.models.user_device import UserDevice
 from app.schemas.admin_devices import (
     CreateDeviceRequest,
     UpdateDeviceRequest,
@@ -39,6 +50,11 @@ from app.api.routes.devices import _build_device_response
 
 router = APIRouter()
 
+async def _get_user_ids_for_device(db: AsyncSession, device_id: str):
+    result = await db.execute(
+        select(UserDevice.user_id).where(UserDevice.device_id == device_id)
+    )
+    return [row[0] for row in result.fetchall()]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GET /api/admin/devices/  — List ALL devices including inactive
@@ -93,12 +109,7 @@ async def create_device(
     current_user: User = Depends(require_root),
     db: AsyncSession = Depends(get_db),
 ):
-    logger.info(
-        f"[Admin] Creating device — id={request.device_id} "
-        f"name='{request.name}' by root={current_user.id}"
-    )
-
-    # Check device_id not already taken
+    # Check device_id not taken
     existing = await db.execute(
         select(Device).where(Device.id == request.device_id)
     )
@@ -108,39 +119,31 @@ async def create_device(
             detail={"error": f"Device ID '{request.device_id}' already exists"},
         )
 
-    # If owner_user_id provided, verify that user exists
-    if request.owner_user_id:
-        user_check = await db.execute(
-            select(User).where(
-                User.id == request.owner_user_id,
-                User.is_active == True,
-            )
-        )
-        if not user_check.scalar_one_or_none():
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "error": (
-                        f"User '{request.owner_user_id}' not found or inactive. "
-                        "Cannot assign device to non-existent user."
-                    )
-                },
-            )
-
     new_device = Device(
-        id=request.device_id,
-        name=request.name,
-        description=request.description,
-        location=request.location,
-        owner_user_id=request.owner_user_id,
+        id=request.device_id, name=request.name,
+        description=request.description, location=request.location,
         is_active=True,
     )
-
     db.add(new_device)
     await db.flush()
 
-    logger.info(f"[Admin] ✅ Device created: {request.device_id}")
+    # Assign users immediately if provided
+    assigned = []
+    for user_id in request.user_ids:
+        user_check = await db.execute(
+            select(User).where(User.id == user_id, User.is_active == True)
+        )
+        if user_check.scalar_one_or_none():
+            db.add(UserDevice(
+                user_id=user_id, device_id=request.device_id,
+                assigned_by=current_user.id,
+            ))
+            assigned.append(user_id)
+        else:
+            logger.warning(f"[Admin] User '{user_id}' not found — skipped in assignment")
 
+    await db.flush()
+    logger.info(f"[Admin] Device created: {request.device_id} assigned_to={assigned}")
     return _build_device_response(new_device)
 
 
@@ -161,45 +164,12 @@ async def update_device(
     db: AsyncSession = Depends(get_db),
 ):
     device = await _get_device_or_404(db, device_id)
-
-    if request.name is not None:
-        device.name = request.name
-
-    if request.description is not None:
-        device.description = request.description
-
-    if request.location is not None:
-        device.location = request.location
-
-    if request.is_active is not None:
-        device.is_active = request.is_active
-
-    # owner_user_id can be set to None (unassign) or a new user ID
-    if "owner_user_id" in request.model_fields_set:
-        if request.owner_user_id is not None:
-            # Verify the new owner exists
-            user_check = await db.execute(
-                select(User).where(
-                    User.id == request.owner_user_id,
-                    User.is_active == True,
-                )
-            )
-            if not user_check.scalar_one_or_none():
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail={
-                        "error": f"User '{request.owner_user_id}' not found or inactive"
-                    },
-                )
-        device.owner_user_id = request.owner_user_id
-
+    if request.name        is not None: device.name        = request.name
+    if request.description is not None: device.description = request.description
+    if request.location    is not None: device.location    = request.location
+    if request.is_active   is not None: device.is_active   = request.is_active
     await db.flush()
-
-    logger.info(
-        f"[Admin] ✅ Device updated: {device_id} "
-        f"by root={current_user.id}"
-    )
-
+    logger.info(f"[Admin] Device updated: {device_id}")
     return _build_device_response(device)
 
 
@@ -224,16 +194,9 @@ async def delete_device(
     device = await _get_device_or_404(db, device_id)
     device.is_active = False
     await db.flush()
+    logger.info(f"[Admin] Device deactivated: {device_id}")
+    return {"message": f"Device '{device_id}' deactivated", "device_id": device_id}
 
-    logger.info(
-        f"[Admin] Device deactivated: {device_id} "
-        f"by root={current_user.id}"
-    )
-
-    return {
-        "message": f"Device '{device_id}' has been deactivated",
-        "device_id": device_id,
-    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -255,38 +218,92 @@ async def assign_device(
     current_user: User = Depends(require_root),
     db: AsyncSession = Depends(get_db),
 ):
-    device = await _get_device_or_404(db, device_id)
+    """
+    Replaces the COMPLETE user access list for this device.
 
-    if request.owner_user_id is not None:
-        # Verify target user exists and is a 'user' role (customers only)
+    How it works:
+      1. Delete ALL existing assignments for this device
+      2. Create new assignments for each user_id in the request list
+      3. Invalid/inactive user_ids are skipped with a warning
+
+    Examples:
+      {"user_ids": ["admin_01", "user_01"]}  → these 2 users get access
+      {"user_ids": []}                        → remove ALL user access
+    """
+    await _get_device_or_404(db, device_id)
+
+    # Step 1: Delete all existing assignments for this device
+    await db.execute(
+        delete(UserDevice).where(UserDevice.device_id == device_id)
+    )
+
+    # Step 2: Create new assignments
+    assigned = []
+    skipped = []
+    for user_id in request.user_ids:
         user_check = await db.execute(
-            select(User).where(
-                User.id == request.owner_user_id,
-                User.is_active == True,
-            )
+            select(User).where(User.id == user_id, User.is_active == True)
         )
-        target_user = user_check.scalar_one_or_none()
-        if not target_user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "error": f"User '{request.owner_user_id}' not found or inactive"
-                },
-            )
-        device.owner_user_id = request.owner_user_id
-        action = f"assigned to user '{request.owner_user_id}'"
-    else:
-        device.owner_user_id = None
-        action = "unassigned (now admin-only)"
+        if user_check.scalar_one_or_none():
+            db.add(UserDevice(
+                user_id=user_id, device_id=device_id,
+                assigned_by=current_user.id,
+            ))
+            assigned.append(user_id)
+        else:
+            skipped.append(user_id)
+            logger.warning(f"[Admin] User '{user_id}' not found — skipped in assignment")
 
     await db.flush()
 
     logger.info(
-        f"[Admin] Device {device_id} {action} "
-        f"by root={current_user.id}"
+        f"[Admin] Device {device_id} access updated — "
+        f"assigned={assigned} skipped={skipped}"
     )
 
+    # Refresh device and return
+    result = await db.execute(select(Device).where(Device.id == device_id))
+    device = result.scalar_one()
     return _build_device_response(device)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET /api/admin/devices/{device_id}/users  — Who has access to this device?
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/devices/{device_id}/users",
+            summary="List users with access to this device")
+async def get_device_users(
+    device_id: str,
+    current_user: User = Depends(require_root),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns the list of users currently assigned to this device.
+    Useful for the root management UI to show who can see a device.
+    """
+    await _get_device_or_404(db, device_id)
+    user_ids = await _get_user_ids_for_device(db, device_id)
+
+    # Fetch user details for each assigned user
+    users_info = []
+    for uid in user_ids:
+        result = await db.execute(select(User).where(User.id == uid))
+        u = result.scalar_one_or_none()
+        if u:
+            users_info.append({
+                "user_id": u.id,
+                "email": u.email,
+                "full_name": u.full_name,
+                "role": u.role,
+                "is_active": u.is_active,
+            })
+
+    return {
+        "device_id": device_id,
+        "assigned_users": users_info,
+        "total": len(users_info),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -294,10 +311,7 @@ async def assign_device(
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _get_device_or_404(db: AsyncSession, device_id: str) -> Device:
-    """Fetch device by ID regardless of is_active status (admin view)."""
-    result = await db.execute(
-        select(Device).where(Device.id == device_id)
-    )
+    result = await db.execute(select(Device).where(Device.id == device_id))
     device = result.scalar_one_or_none()
     if not device:
         raise HTTPException(

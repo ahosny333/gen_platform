@@ -3,6 +3,10 @@ app/api/routes/devices.py
 ──────────────────────────
 Device & History API Routes
 ═══════════════════════════════════════════════════════════════════════════════
+Access rules:
+  root   → sees ALL active devices (bypasses junction table)
+  admin  → sees only devices in user_devices where user_id = their id
+  user   → sees only devices in user_devices where user_id = their id
 
 Endpoints in this file:
   GET  /api/devices                          → list all devices for current user
@@ -27,6 +31,7 @@ from app.core.logging import logger
 from app.db.database import get_db
 from app.models.device import Device
 from app.models.user import User
+from app.models.user_device import UserDevice
 from app.schemas.devices import (
     DeviceResponse,
     DeviceListResponse,
@@ -120,7 +125,7 @@ def _build_device_response(device: Device) -> DeviceResponse:
     summary="Get all devices",
     description=(
         "Returns all generators the current user has access to. "
-        "Admins see all devices. External users see only assigned devices."
+        "root see all devices. External users see only assigned devices."
     ),
 )
 async def get_devices(
@@ -128,34 +133,34 @@ async def get_devices(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Role-based device listing:
-      - Admin role   → returns ALL active devices
-      - User role    → returns only devices assigned to this user
+    root  → all active devices (no junction table needed)
+    admin → active devices assigned to them via user_devices
+    user  → active devices assigned to them via user_devices
     """
     logger.info(
         f"[Devices] GET /devices — user={current_user.id} "
         f"role={current_user.role}"
     )
 
-    # Build query based on role
-    if current_user.role == "admin":
-        # Admin sees everything
-        query = select(Device).where(Device.is_active == True)
-    else:
-        # External user sees only their assigned devices
-        query = select(Device).where(
-            Device.is_active == True,
-            Device.owner_user_id == current_user.id,
+    if current_user.role == "root":
+        # Root sees everything — bypass junction table
+        result = await db.execute(
+            select(Device).where(Device.is_active == True)
         )
-
-    result = await db.execute(query)
-    devices = result.scalars().all()
-
-    device_responses = [_build_device_response(d) for d in devices]
+        devices = result.scalars().all()
+    else:
+        # admin and user: query via junction table
+        result = await db.execute(
+            select(Device)
+            .join(UserDevice, Device.id == UserDevice.device_id)
+            .where(UserDevice.user_id == current_user.id)
+            .where(Device.is_active == True)
+        )
+        devices = result.scalars().all()
 
     return DeviceListResponse(
-        total=len(device_responses),
-        devices=device_responses,
+        total=len(devices),
+        devices=[_build_device_response(d) for d in devices],
     )
 
 
@@ -301,22 +306,33 @@ async def _get_device_or_404(
     current_user: User,
 ) -> Device:
     """
-    Fetch a device by ID, checking both existence and user access.
-    Raises HTTP 404 if not found or user doesn't have access.
+    Fetch device with role-based access check.
 
-    NOTE: We return 404 (not 403) even for unauthorized access.
-    This prevents attackers from enumerating valid device IDs.
+    root  → any active device
+    admin → only if in user_devices for their user_id
+    user  → only if in user_devices for their user_id
+
+    Returns 404 for both "not found" and "no access"
+    (prevents device ID enumeration by unauthorized users)
     """
-    query = select(Device).where(
-        Device.id == device_id,
-        Device.is_active == True,
-    )
+    if current_user.role == "root":
+        # Root bypasses junction table
+        result = await db.execute(
+            select(Device).where(
+                Device.id == device_id,
+                Device.is_active == True,
+            )
+        )
+    else:
+        # admin and user: must be in junction table
+        result = await db.execute(
+            select(Device)
+            .join(UserDevice, Device.id == UserDevice.device_id)
+            .where(Device.id == device_id)
+            .where(Device.is_active == True)
+            .where(UserDevice.user_id == current_user.id)
+        )
 
-    # Non-admin users can only see their own devices
-    if current_user.role != "admin":
-        query = query.where(Device.owner_user_id == current_user.id)
-
-    result = await db.execute(query)
     device = result.scalar_one_or_none()
 
     if not device:
@@ -324,5 +340,4 @@ async def _get_device_or_404(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"error": f"Device '{device_id}' not found"},
         )
-
     return device

@@ -20,7 +20,7 @@ import uuid
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import require_root
@@ -29,6 +29,7 @@ from app.core.security import hash_password
 from app.db.database import get_db
 from app.models.device import Device
 from app.models.user import User
+from app.models.user_device import UserDevice
 from app.schemas.users import (
     CreateUserRequest,
     UpdateUserRequest,
@@ -38,6 +39,12 @@ from app.schemas.users import (
 
 router = APIRouter()
 
+async def _get_assigned_device_ids(db: AsyncSession, user_id: str) -> List[str]:
+    """Return list of device IDs assigned to a user via junction table."""
+    result = await db.execute(
+        select(UserDevice.device_id).where(UserDevice.user_id == user_id)
+    )
+    return [row[0] for row in result.fetchall()]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GET /api/users/  — List all users
@@ -53,30 +60,20 @@ async def list_users(
     current_user: User = Depends(require_root),
     db: AsyncSession = Depends(get_db),
 ):
-    logger.info(f"[Users] GET /users — requested by root={current_user.id}")
-
     result = await db.execute(select(User).order_by(User.created_at.desc()))
     users = result.scalars().all()
 
     user_responses = []
     for user in users:
-        # Get device IDs assigned to this user
-        device_result = await db.execute(
-            select(Device.id).where(Device.owner_user_id == user.id)
-        )
-        assigned = [row[0] for row in device_result.fetchall()]
-
+        assigned = await _get_assigned_device_ids(db, user.id)
         user_responses.append(UserResponse(
-            id=user.id,
-            email=user.email,
-            full_name=user.full_name,
-            role=user.role,
-            is_active=user.is_active,
-            created_at=user.created_at,
-            assigned_devices=assigned,
+            id=user.id, email=user.email, full_name=user.full_name,
+            role=user.role, is_active=user.is_active,
+            created_at=user.created_at, assigned_devices=assigned,
         ))
 
     return UserListResponse(total=len(user_responses), users=user_responses)
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -95,49 +92,47 @@ async def create_user(
     current_user: User = Depends(require_root),
     db: AsyncSession = Depends(get_db),
 ):
-    logger.info(
-        f"[Users] Creating user — email={request.email} "
-        f"role={request.role} by root={current_user.id}"
-    )
-
-    # Check email not already taken
-    existing = await db.execute(
-        select(User).where(User.email == request.email)
-    )
+    # Check email not taken
+    existing = await db.execute(select(User).where(User.email == request.email))
     if existing.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"error": f"Email '{request.email}' is already registered"},
+            detail={"error": f"Email '{request.email}' already registered"},
         )
 
-    # Generate a unique ID
-    # Format: role prefix + short UUID  e.g. "user_a3f8c2d1"
-    prefix = request.role
-    new_id = f"{prefix}_{uuid.uuid4().hex[:8]}"
-
+    new_id = f"{request.role}_{uuid.uuid4().hex[:8]}"
     new_user = User(
-        id=new_id,
-        email=request.email,
+        id=new_id, email=request.email,
         hashed_password=hash_password(request.password),
-        full_name=request.full_name,
-        role=request.role,
-        is_active=True,
+        full_name=request.full_name, role=request.role, is_active=True,
     )
-
     db.add(new_user)
-    await db.flush()   # Get the DB row without committing yet
+    await db.flush()
 
-    logger.info(f"[Users] ✅ User created: id={new_id} email={request.email}")
+    # Assign devices if provided
+    assigned = []
+    for device_id in request.device_ids:
+        dev = await db.execute(
+            select(Device).where(Device.id == device_id, Device.is_active == True)
+        )
+        if dev.scalar_one_or_none():
+            db.add(UserDevice(
+                user_id=new_id, device_id=device_id,
+                assigned_by=current_user.id,
+            ))
+            assigned.append(device_id)
+        else:
+            logger.warning(f"[Users] Device '{device_id}' not found during user creation — skipped")
+
+    await db.flush()
+    logger.info(f"[Users] Created user id={new_id} email={request.email} devices={assigned}")
 
     return UserResponse(
-        id=new_user.id,
-        email=new_user.email,
-        full_name=new_user.full_name,
-        role=new_user.role,
-        is_active=new_user.is_active,
-        created_at=new_user.created_at,
-        assigned_devices=[],
+        id=new_user.id, email=new_user.email, full_name=new_user.full_name,
+        role=new_user.role, is_active=new_user.is_active,
+        created_at=new_user.created_at, assigned_devices=assigned,
     )
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -155,20 +150,11 @@ async def get_user(
     db: AsyncSession = Depends(get_db),
 ):
     user = await _get_user_or_404(db, user_id)
-
-    device_result = await db.execute(
-        select(Device.id).where(Device.owner_user_id == user.id)
-    )
-    assigned = [row[0] for row in device_result.fetchall()]
-
+    assigned = await _get_assigned_device_ids(db, user.id)
     return UserResponse(
-        id=user.id,
-        email=user.email,
-        full_name=user.full_name,
-        role=user.role,
-        is_active=user.is_active,
-        created_at=user.created_at,
-        assigned_devices=assigned,
+        id=user.id, email=user.email, full_name=user.full_name,
+        role=user.role, is_active=user.is_active,
+        created_at=user.created_at, assigned_devices=assigned,
     )
 
 
@@ -193,58 +179,36 @@ async def update_user(
 ):
     user = await _get_user_or_404(db, user_id)
 
-    # Safety: prevent root from accidentally deactivating themselves
     if user_id == current_user.id and request.is_active is False:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"error": "You cannot deactivate your own account"},
         )
 
-    # Apply only the fields that were sent (partial update)
     if request.email is not None:
-        # Check new email not taken by another user
-        existing = await db.execute(
-            select(User).where(
-                User.email == request.email,
-                User.id != user_id,
-            )
+        dup = await db.execute(
+            select(User).where(User.email == request.email, User.id != user_id)
         )
-        if existing.scalar_one_or_none():
+        if dup.scalar_one_or_none():
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"error": f"Email '{request.email}' is already in use"},
+                detail={"error": f"Email '{request.email}' already in use"},
             )
         user.email = request.email
 
-    if request.full_name is not None:
-        user.full_name = request.full_name
-
-    if request.role is not None:
-        user.role = request.role
-
-    if request.is_active is not None:
-        user.is_active = request.is_active
-
-    if request.password is not None:
-        user.hashed_password = hash_password(request.password)
+    if request.full_name  is not None: user.full_name  = request.full_name
+    if request.role       is not None: user.role       = request.role
+    if request.is_active  is not None: user.is_active  = request.is_active
+    if request.password   is not None: user.hashed_password = hash_password(request.password)
 
     await db.flush()
+    logger.info(f"[Users] Updated user id={user_id}")
 
-    logger.info(f"[Users] ✅ User updated: id={user_id} by root={current_user.id}")
-
-    device_result = await db.execute(
-        select(Device.id).where(Device.owner_user_id == user.id)
-    )
-    assigned = [row[0] for row in device_result.fetchall()]
-
+    assigned = await _get_assigned_device_ids(db, user.id)
     return UserResponse(
-        id=user.id,
-        email=user.email,
-        full_name=user.full_name,
-        role=user.role,
-        is_active=user.is_active,
-        created_at=user.created_at,
-        assigned_devices=assigned,
+        id=user.id, email=user.email, full_name=user.full_name,
+        role=user.role, is_active=user.is_active,
+        created_at=user.created_at, assigned_devices=assigned,
     )
 
 
@@ -266,26 +230,17 @@ async def delete_user(
     current_user: User = Depends(require_root),
     db: AsyncSession = Depends(get_db),
 ):
-    # Cannot delete yourself
     if user_id == current_user.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"error": "You cannot deactivate your own account"},
         )
-
     user = await _get_user_or_404(db, user_id)
     user.is_active = False
     await db.flush()
+    logger.info(f"[Users] Deactivated user id={user_id}")
+    return {"message": f"User '{user.email}' deactivated", "user_id": user_id}
 
-    logger.info(
-        f"[Users] User deactivated: id={user_id} "
-        f"email={user.email} by root={current_user.id}"
-    )
-
-    return {
-        "message": f"User '{user.email}' has been deactivated",
-        "user_id": user_id,
-    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

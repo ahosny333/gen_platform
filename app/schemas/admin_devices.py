@@ -11,10 +11,12 @@ Shapes for the device management endpoints:
 
 Note: DeviceResponse for reading is already in schemas/devices.py
 These schemas are specifically for CREATE and UPDATE operations.
+Updated for Many-to-Many:
+  AssignDeviceRequest now accepts a LIST of user IDs instead of one user.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
-from typing import Optional
+from typing import List,Optional
 from pydantic import BaseModel, Field
 
 
@@ -33,7 +35,7 @@ class CreateDeviceRequest(BaseModel):
         "name": "Generator 5 - Site C",
         "description": "Emergency backup unit",
         "location": "Tower C - Level B2",
-        "owner_user_id": "user_abc123"
+        "user_ids": ["user_abc123"]
     }
     """
     device_id: str = Field(
@@ -56,10 +58,11 @@ class CreateDeviceRequest(BaseModel):
         default=None,
         example="Tower C - Level B2",
     )
-    owner_user_id: Optional[str] = Field(
-        default=None,
-        example="user_abc123",
-        description="Assign to a customer user. Leave null for admin-only access.",
+    # Optional: assign to users immediately on creation
+    user_ids: List[str] = Field(
+        default=[],
+        example=["admin_01", "user_01"],
+        description="List of user IDs to assign this device to on creation.",
     )
 
 
@@ -73,23 +76,11 @@ class UpdateDeviceRequest(BaseModel):
         "name": "Generator 5 - Relocated to Site D"
     }
 
-    Example (reassign to different customer):
-    {
-        "owner_user_id": "user_xyz789"
-    }
-
-    Example (unassign from customer — make admin-only):
-    {
-        "owner_user_id": null
-    }
+    Does NOT change user assignments (use /assign endpoint for that).
     """
     name: Optional[str] = Field(default=None)
     description: Optional[str] = Field(default=None)
     location: Optional[str] = Field(default=None)
-    owner_user_id: Optional[str] = Field(
-        default=None,
-        description="Set to null to remove customer assignment",
-    )
     is_active: Optional[bool] = Field(
         default=None,
         description="Set false to deactivate (soft delete)",
@@ -99,16 +90,25 @@ class UpdateDeviceRequest(BaseModel):
 class AssignDeviceRequest(BaseModel):
     """
     Body for POST /api/admin/devices/{device_id}/assign
-    Quickly assign or unassign a device to a customer.
 
-    Example (assign):
-    { "owner_user_id": "user_abc123" }
+    Replaces the FULL user list for this device.
+    Whatever you send here becomes the complete access list.
 
-    Example (unassign):
-    { "owner_user_id": null }
+    Example — give gen_01 access to 3 users:
+    { "user_ids": ["admin_01", "user_01", "user_02"] }
+
+    Example — remove ALL user access (unassign everyone):
+    { "user_ids": [] }
+
+    Example — give access to only one user:
+    { "user_ids": ["user_03"] }
     """
-    owner_user_id: Optional[str] = Field(
-        default=None,
-        example="user_abc123",
-        description="User ID to assign to, or null to unassign",
+    user_ids: List[str] = Field(
+        ...,
+        example=["admin_01", "user_01", "user_02"],
+        description=(
+            "Complete list of user IDs that should have access to this device. "
+            "Replaces existing assignments entirely. "
+            "Send empty list [] to remove all user access."
+        ),
     )
