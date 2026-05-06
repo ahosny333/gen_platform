@@ -135,13 +135,11 @@ async def health_check():
 
 
 # ── Future route registrations (Steps 2–5) ───────────────────────────────────
-from app.api.routes import auth                                  # ← NEW Step 2
-from app.api.routes import devices                               # ← NEW Step 3
-from app.api.routes import users    # ← NEW root-only user management
-from app.api.routes import admin    # ← NEW root-only device management
+from app.api.routes import auth, devices, users, admin, events
 
 app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
 app.include_router(devices.router, prefix="/api/devices", tags=["Devices"])  # ← NEW
+app.include_router(events.router,  prefix="/api/devices", tags=["Events & Alarms"])
 app.include_router(users.router,   prefix="/api/users",   tags=["User Management (Root)"])
 app.include_router(admin.router,   prefix="/api/admin",   tags=["Admin Management (Root)"])
 

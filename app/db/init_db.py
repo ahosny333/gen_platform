@@ -32,6 +32,7 @@ from app.models.user import User  # noqa: F401
 from app.models.device import Device                # noqa: F401
 from app.models.telemetry import TelemetryReading   # noqa: F401
 from app.models.user_device import UserDevice       # noqa: F401  ← NEW
+from app.models.device_event import DeviceLastEvent, EventHistory  # noqa: F401       # noqa: F401  ← NEW
 
 settings = get_settings()
 

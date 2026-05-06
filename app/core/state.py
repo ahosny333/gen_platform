@@ -14,6 +14,15 @@ This module is the CRITICAL GLUE between two concurrent worlds:
   │  (sync write)       │  shared  │  (async readers)          │
   └─────────────────────┘  state   └──────────────────────────┘
 
+Updated to support 3 message types:
+
+  telemetry queue  → live readings from generator/{device_id}/data
+  event_state queue → full event dumps from generator/{device_id}/event/state
+  event_update queue → single changes from generator/{device_id}/event/update
+
+Each has its own asyncio.Queue so they never mix or block each other.
+The data_router reads from all three queues and routes to the right service.
+
 Design decisions:
   - asyncio.Queue per device: thread-safe, non-blocking for async consumers
   - Latest snapshot dict: WebSocket can immediately send last known state
@@ -33,17 +42,34 @@ from app.core.logging import logger
 @dataclass
 class DeviceState:
     """
-    Per-device shared state container.
+    Per-device shared state container - holds all queues and latest snapshots.
 
     Attributes:
         latest_payload:  The most recent telemetry dict received from MQTT.
                          Used to immediately hydrate a new WebSocket client.
         queue:           asyncio.Queue fed by the MQTT thread.
                          Each WebSocket handler consumes from this queue.
+                         Three separate queues for three message types:
+                            queue              → telemetry readings (sensor data)
+                            event_state_queue  → full event state dumps (all events at once)
+                            event_update_queue → single event changes (one event changed)
         websocket_clients: Active WebSocket connections subscribed to this device.
     """
+    # ── Telemetry (sensor readings) ────────────────────────────────────────────
     latest_payload: Dict[str, Any] = field(default_factory=dict)
-    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=100))
+    queue: asyncio.Queue = field(
+        default_factory=lambda: asyncio.Queue(maxsize=100)
+    )
+
+    # ── Events (alarms and digital states) ────────────────────────────────────
+    latest_events: Dict[str, Any] = field(default_factory=dict)
+    event_state_queue: asyncio.Queue = field(
+        default_factory=lambda: asyncio.Queue(maxsize=50)
+    )
+    event_update_queue: asyncio.Queue = field(
+        default_factory=lambda: asyncio.Queue(maxsize=50)
+    )
+    # ── WebSocket clients ──────────────────────────────────────────────────────
     websocket_clients: Set[Any] = field(default_factory=set)
 
 
@@ -91,23 +117,23 @@ class SharedStateManager:
             we drop the oldest item first (sliding window behavior).
         """
         state = self.get_or_create_device(device_id)
-
-        # Update latest snapshot (always — even on Modbus fail status=0)
         state.latest_payload = payload
+        self._safe_put(state.queue, payload, device_id, "telemetry")
 
-        # Push to queue — if full, drop oldest to make room (never block MQTT)
-        if state.queue.full():
-            try:
-                state.queue.get_nowait()  # discard oldest
-                logger.debug(f"[State] Queue full for {device_id}, dropped oldest item")
-            except asyncio.QueueEmpty:
-                pass
+    # ── Event state update (from generator/{id}/event/state) ──────────────────
 
-        try:
-            state.queue.put_nowait(payload)
-            logger.debug(f"[State] Queued payload for device: {device_id}")
-        except asyncio.QueueFull:
-            logger.warning(f"[State] Could not queue payload for {device_id}")
+    def update_event_state(self, device_id: str, payload: Dict[str, Any]) -> None:
+        """Push full event state dump into device's event_state queue."""
+        state = self.get_or_create_device(device_id)
+        state.latest_events = payload
+        self._safe_put(state.event_state_queue, payload, device_id, "event_state")
+
+    # ── Single event update (from generator/{id}/event/update) ────────────────
+
+    def update_single_event(self, device_id: str, payload: Dict[str, Any]) -> None:
+        """Push single event change into device's event_update queue."""
+        state = self.get_or_create_device(device_id)
+        self._safe_put(state.event_update_queue, payload, device_id, "event_update")
 
     # ── WebSocket Client Registry ──────────────────────────────────────────────
 
@@ -141,12 +167,39 @@ class SharedStateManager:
         return {
             device_id: {
                 "has_data": bool(state.latest_payload),
-                "queue_size": state.queue.qsize(),
+                "telemetry_queue": state.queue.qsize(),
+                "event_state_queue": state.event_state_queue.qsize(),
+                "event_update_queue": state.event_update_queue.qsize(),
                 "ws_clients": len(state.websocket_clients),
                 "last_status": state.latest_payload.get("status"),
+                "active_events": {
+                    k: v for k, v in state.latest_events.items() if v is True
+                },
             }
             for device_id, state in self._devices.items()
         }
+
+    # ── Private helper ─────────────────────────────────────────────────────────
+
+    def _safe_put(
+        self,
+        queue: asyncio.Queue,
+        payload: Dict[str, Any],
+        device_id: str,
+        queue_type: str,
+    ) -> None:
+        """Put payload in queue, dropping oldest if full. Never blocks."""
+        if queue.full():
+            try:
+                queue.get_nowait()
+                logger.debug(f"[State] {queue_type} queue full for {device_id}, dropped oldest")
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            logger.warning(f"[State] Could not queue {queue_type} for {device_id}")
+
 
 
 # ── Singleton ──────────────────────────────────────────────────────────────────

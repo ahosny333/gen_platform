@@ -6,7 +6,15 @@ MQTT Background Service
 
 Responsibilities:
   1. Connect to the MQTT broker at startup
-  2. Subscribe to  generator/+/data  (all device data topics)
+  2. 
+    Now subscribes to 3 topic patterns:
+
+    generator/+/data           → telemetry readings (sensor data)
+    generator/+/event/state    → full event state dump (all events)
+    generator/+/event/update   → single event change
+
+    on_message() routes each message to the correct shared_state method
+    based on the topic pattern it matched.
   3. On each message → parse JSON → push to shared state
   4. Provide publish() method for the Control API to send commands to devices
   5. Handle reconnection automatically
@@ -81,7 +89,6 @@ class MQTTService:
         self._client.reconnect_delay_set(min_delay=2, max_delay=30)
 
         # Connect (non-blocking)
-        print("------kkkkkk-----")
         print(f"Connecting to MQTT broker at {settings.mqtt_broker_host}:{settings.mqtt_broker_port}...")
         try:
             self._client.connect(
@@ -225,9 +232,13 @@ class MQTTService:
         Runs in the MQTT background thread — MUST be fast and non-blocking.
 
         Flow:
-          1. Extract device_id from topic  (generator/gen_01/data → gen_01)
+          1. Extract device_id from topic  ex: (generator/gen_01/data → gen_01)
           2. Parse JSON payload
           3. Push to shared_state (thread-safe asyncio.Queue)
+            Topic patterns and routing:
+            generator/{id}/data           → shared_state.update_from_mqtt()
+            generator/{id}/event/state    → shared_state.update_event_state()
+            generator/{id}/event/update   → shared_state.update_single_event()
           4. Return immediately
         """
         topic: str = msg.topic
@@ -235,43 +246,56 @@ class MQTTService:
         # ── Extract device_id from topic ──────────────────────────────────────
         # Topic pattern: generator/{device_id}/data
         parts = topic.split("/")
-        if len(parts) != 3:
-            logger.warning(f"[MQTT] Unexpected topic format: {topic}")
-            return
-
-        device_id = parts[1]
-
-        # ── Parse JSON ────────────────────────────────────────────────────────
+        # ── Parse JSON payload ─────────────────────────────────────────────────
         try:
             raw = msg.payload.decode("utf-8")
             payload: Dict[str, Any] = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            logger.error(
-                f"[MQTT] Failed to parse message from {topic}: {exc} "
-                f"| raw={msg.payload[:200]}"
-            )
+            logger.error(f"[MQTT] Failed to parse {topic}: {exc}")
             return
 
-        logger.debug(
-            f"[MQTT] ← {topic} | status={payload.get('status')} "
-            f"| rpm={payload.get('rpm')} | ts={payload.get('timestamp')}"
-        )
+        # ── Route by topic pattern ─────────────────────────────────────────────
 
-        # ── Push to shared state (bridges sync MQTT → async WebSocket) ────────
-        shared_state.update_from_mqtt(device_id, payload)
+        # Pattern: generator/{device_id}/data  (3 parts)
+        if len(parts) == 3 and parts[0] == "generator" and parts[2] == "data":
+            device_id = parts[1]
+            logger.debug(f"[MQTT] ← telemetry {device_id} status={payload.get('status')}")
+            shared_state.update_from_mqtt(device_id, payload)
+
+        # Pattern: generator/{device_id}/event/state  (4 parts)
+        elif (len(parts) == 4 and parts[0] == "generator"
+              and parts[2] == "event" and parts[3] == "state"):
+            device_id = parts[1]
+            logger.debug(f"[MQTT] ← event/state {device_id} events={list(payload.keys())}")
+            shared_state.update_event_state(device_id, payload)
+
+        # Pattern: generator/{device_id}/event/update  (4 parts)
+        elif (len(parts) == 4 and parts[0] == "generator"
+              and parts[2] == "event" and parts[3] == "update"):
+            device_id = parts[1]
+            logger.debug(
+                f"[MQTT] ← event/update {device_id} "
+                f"event={payload.get('event')} value={payload.get('value')}"
+            )
+            shared_state.update_single_event(device_id, payload)
+
+        else:
+            logger.warning(f"[MQTT] Unrecognized topic pattern: {topic}")
+       
 
     # ══════════════════════════════════════════════════════════════════════════
     # Private Helpers
     # ══════════════════════════════════════════════════════════════════════════
 
     def _subscribe_all(self) -> None:
-        """Subscribe to all relevant topics after connect/reconnect."""
+        """Subscribe to all 3 topic patterns after connect/reconnect."""
         topics = [
-            (settings.mqtt_data_topic, 0),   # QoS 0 for telemetry (high freq)
+            ("generator/+/data",         0),  # QoS 0 — high frequency telemetry
+            ("generator/+/event/state",  1),  # QoS 1 — periodic full state dump
+            ("generator/+/event/update", 1),  # QoS 1 — spontaneous alarm changes
         ]
         self._client.subscribe(topics)
-        logger.info(f"[MQTT] Subscribed to topics: {[t[0] for t in topics]}")
-
+        logger.info(f"[MQTT] Subscribed to: {[t[0] for t in topics]}")
 
 # ── Singleton ──────────────────────────────────────────────────────────────────
 # Imported by main.py (lifespan) and Control API route

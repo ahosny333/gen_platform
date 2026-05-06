@@ -28,6 +28,27 @@ Full data flow after this fix:
      ▼
   REST API /history  serves data to frontend charts
 
+Background Data Router — All Queues → Database
+═══════════════════════════════════════════════════════════════════════════════
+
+Updated to handle 3 queue types per device:
+
+  telemetry queue      → telemetry_service.save_reading()
+  event_state queue    → event_service.process_full_state()
+  event_update queue   → event_service.process_single_update()
+
+One supervisor spawns 3 workers per device (one per queue type).
+Workers are completely independent — a slow DB write on one never
+blocks the others.
+
+Full data flow:
+
+  ESP32
+    ├── generator/{id}/data          → telemetry_queue  → telemetry_service → DB
+    ├── generator/{id}/event/state   → event_state_queue → event_service → DB
+    └── generator/{id}/event/update  → event_update_queue → event_service → DB
+
+
 Why a separate background task instead of saving in on_message()?
 ──────────────────────────────────────────────────────────────────
   on_message() runs in the MQTT sync thread.
@@ -45,7 +66,7 @@ from app.core.logging import logger
 from app.core.state import shared_state, DeviceState
 from app.db.database import AsyncSessionLocal
 from app.services.telemetry_service import telemetry_service
-
+from app.services.event_service import event_service
 
 class DataRouter:
     """
@@ -125,19 +146,17 @@ class DataRouter:
 
         while self._running:
             try:
-                known_devices = shared_state.list_device_ids()
-
-                for device_id in known_devices:
-                    if device_id not in self._running_tasks:
-                        # New device seen for the first time — spawn a worker
-                        task = asyncio.create_task(
-                            self._device_worker(device_id),
-                            name=f"data_router_{device_id}",
-                        )
-                        self._running_tasks[device_id] = task
-                        logger.info(
-                            f"[DataRouter] Spawned worker for new device: {device_id}"
-                        )
+                for device_id in shared_state.list_device_ids():
+                    # One task key per device+type combination
+                    for worker_type in ("telemetry", "event_state", "event_update"):
+                        task_key = f"{device_id}:{worker_type}"
+                        if task_key not in self._running_tasks:
+                            task = asyncio.create_task(
+                                self._device_worker(device_id, worker_type),
+                                name=f"router_{task_key}",
+                            )
+                            self._running_tasks[task_key] = task
+                            logger.info(f"[DataRouter] Spawned {worker_type} worker for {device_id}")
 
                 # Check every 2 seconds for new devices
                 await asyncio.sleep(2)
@@ -149,97 +168,133 @@ class DataRouter:
                 await asyncio.sleep(5)   # Wait before retrying
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Device Worker — drains one device's queue into the database
+    # Device Worker — one per device per queue type -- drains one device's queue into the database
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def _device_worker(self, device_id: str) -> None:
+    async def _device_worker(self, device_id: str, worker_type: str) -> None:
         """
         Runs forever for one specific device.
         Waits for payloads in the device's asyncio.Queue,
-        then saves each one to the database.
+        then saves each one to the database (Calls the correct service).
+
+        Generic worker that drains one specific queue for one device.
+        Calls the correct service based on worker_type.
 
         One worker per device means:
           - gen_01 slow DB write never blocks gen_02
           - Each device processed independently
           - Backpressure handled per-device
         """
-        logger.info(f"[DataRouter] Worker started for device: {device_id}")
+        logger.info(f"[DataRouter] {worker_type} worker started for {device_id}")
 
         while self._running:
             try:
-                device_state: DeviceState = shared_state.get_device(device_id)
-
-                if not device_state:
-                    # Device disappeared from state (shouldn't happen, but safe)
+                state: DeviceState = shared_state.get_device(device_id)
+                if not state:
                     await asyncio.sleep(1)
                     continue
+
+                # Select which queue to drain based on worker type
+                if worker_type == "telemetry":
+                    queue = state.queue
+                elif worker_type == "event_state":
+                    queue = state.event_state_queue
+                else:
+                    queue = state.event_update_queue
 
                 # Wait for next payload from the queue
                 # timeout=5.0 means we check self._running every 5s
                 # even if no data arrives (allows clean shutdown)
                 try:
                     payload: Dict[str, Any] = await asyncio.wait_for(
-                        device_state.queue.get(),
-                        timeout=5.0,
+                        queue.get(), timeout=5.0
                     )
                 except asyncio.TimeoutError:
                     # No data in 5 seconds — loop back and check _running
                     continue
 
-                # Save to database
-                await self._save_to_db(device_id, payload)
+                # Route to correct service
+                if worker_type == "telemetry":
+                    await self._save_telemetry(device_id, payload)
+                elif worker_type == "event_state":
+                    await self._save_event_state(device_id, payload)
+                else:
+                    await self._save_event_update(device_id, payload)
 
-                # Mark queue task as done
-                device_state.queue.task_done()
+                queue.task_done()
 
             except asyncio.CancelledError:
                 logger.info(f"[DataRouter] Worker cancelled for: {device_id}")
                 break
             except Exception as exc:
-                logger.error(
-                    f"[DataRouter] Worker error for {device_id}: {exc}"
-                )
+                logger.error(f"[DataRouter] {worker_type} worker error {device_id}: {exc}")
                 # Brief pause before retrying to avoid tight error loop
                 await asyncio.sleep(1)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Database Persistence
+    # DB Persistence Methods
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def _save_to_db(
-        self,
-        device_id: str,
-        payload: Dict[str, Any],
-    ) -> None:
-        """
-        Open a database session and save the telemetry reading.
+    async def _save_telemetry(self, device_id: str, payload: Dict[str, Any]) -> None:
+        """Save telemetry reading → telemetry_readings table."""
+        try:
+            async with AsyncSessionLocal() as session:
+                await telemetry_service.save_reading(
+                    db=session, device_id=device_id, payload=payload
+                )
+                await session.commit()
+        except Exception as exc:
+            logger.error(f"[DataRouter] Telemetry DB save failed {device_id}: {exc}")
 
-        We open a NEW session per save (not reusing one session forever)
-        because long-lived sessions cause stale connection issues.
-        AsyncSessionLocal() is cheap — it borrows from the connection pool.
+    async def _save_event_state(self, device_id: str, payload: Dict[str, Any]) -> None:
+        """
+        Process full event state dump → device_last_events + events_history.
+
+        Payload format: {"low_oil_pressure": false, "high_temp": true, ...}
         """
         try:
             async with AsyncSessionLocal() as session:
-                reading = await telemetry_service.save_reading(
+                await event_service.process_full_state(
+                    db=session, device_id=device_id, payload=payload
+                )
+                await session.commit()
+        except Exception as exc:
+            logger.error(f"[DataRouter] Event state save failed {device_id}: {exc}")
+
+    async def _save_event_update(self, device_id: str, payload: Dict[str, Any]) -> None:
+        """
+        Process single event update → device_last_events + events_history.
+
+        Payload format: {"event": "fuel_low", "value": true}
+        """
+        try:
+            event_name = payload.get("event")
+            value = payload.get("value")
+
+            if event_name is None or value is None:
+                logger.warning(
+                    f"[DataRouter] Invalid event/update payload for {device_id}: {payload}"
+                )
+                return
+
+            if not isinstance(value, bool):
+                logger.warning(
+                    f"[DataRouter] event/update value must be bool, got {type(value)} — {device_id}"
+                )
+                return
+
+            async with AsyncSessionLocal() as session:
+                await event_service.process_single_update(
                     db=session,
                     device_id=device_id,
-                    payload=payload,
+                    event_name=event_name,
+                    new_value=value,
                 )
                 await session.commit()
 
-                logger.debug(
-                    f"[DataRouter] Saved to DB — device={device_id} "
-                    f"status={payload.get('status')} "
-                    f"ts={payload.get('timestamp')}"
-                )
-
         except Exception as exc:
-            logger.error(
-                f"[DataRouter] DB save failed for {device_id}: {exc} "
-                f"| payload keys: {list(payload.keys())}"
-            )
-            # We don't re-raise — a failed save should not crash the worker
-            # The reading is lost but the worker continues for future readings
+            logger.error(f"[DataRouter] Event update save failed {device_id}: {exc}")
+
 
 
 # ── Singleton ──────────────────────────────────────────────────────────────────
