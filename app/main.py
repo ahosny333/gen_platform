@@ -15,12 +15,21 @@ Startup sequence:
 The lifespan pattern (replacing deprecated @app.on_event) is the
 FastAPI-recommended approach for managing background services.
 
-Role-based route access summary:
-  /api/auth/       → public (no auth)
-  /api/devices/    → all authenticated users (filtered by role)
-  /api/users/      → root only
-  /api/admin/      → root only
-  /api/devices/{id}/command → admin + root only (Step 5)
+Services started at startup:
+  1. Database   → create tables + seed default data
+  2. MQTT       → connect broker, subscribe to all topics
+  3. DataRouter → background workers: queue → DB → WebSocket broadcast
+
+Route map:
+  POST   /api/auth/login                        public
+  GET    /api/devices/                          all authenticated users
+  GET    /api/devices/{id}/history              all authenticated users
+  GET    /api/devices/{id}/events               all authenticated users
+  GET    /api/devices/{id}/events/history       all authenticated users
+  POST   /api/devices/{id}/command              admin + root  (Step 5)
+  GET    /api/users/                            root only
+  POST   /api/admin/devices/                    root only
+  WS     /ws/{device_id}?token=JWT              all authenticated users
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -35,6 +44,7 @@ from app.core.logging import logger
 from app.core.state import shared_state
 from app.services.mqtt_service import mqtt_service
 from app.services.data_router import data_router
+from app.services.ws_manager import ws_manager
 from app.db.init_db import init_db
 settings = get_settings()
 
@@ -130,18 +140,20 @@ async def health_check():
         "version": settings.app_version,
         "mqtt_connected": mqtt_service.is_connected,
         "data_router_running": data_router._running,
+        "websocket_connections": ws_manager.get_all_stats(),
         "devices": shared_state.summary(),
     })
 
 
 # ── Future route registrations (Steps 2–5) ───────────────────────────────────
-from app.api.routes import auth, devices, users, admin, events
+from app.api.routes import auth, devices, users, admin, events, websocket
 
 app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
 app.include_router(devices.router, prefix="/api/devices", tags=["Devices"])  # ← NEW
 app.include_router(events.router,  prefix="/api/devices", tags=["Events & Alarms"])
 app.include_router(users.router,   prefix="/api/users",   tags=["User Management (Root)"])
 app.include_router(admin.router,   prefix="/api/admin",   tags=["Admin Management (Root)"])
+app.include_router(websocket.router, tags=["WebSocket"])     # ← NEW Step 4
 
 # from app.api.routes import auth, devices, websocket, commands
 # app.include_router(auth.router,     prefix="/api/auth",    tags=["Auth"])

@@ -131,6 +131,33 @@ ESP32 PLC / Simulator
 
 ---
 
+## The Complete Data Pipeline with websocket push to frontend
+
+```
+ESP32
+  │
+  │ MQTT
+  ▼
+Mosquitto Broker
+  │
+  ▼
+mqtt_service.on_message()          [sync thread]
+  │  → parses topic
+  │  → puts in correct shared_state queue
+  ▼
+data_router worker                 [async background task]
+  │
+  ├── 1. Save to database          [persistence]
+  │       telemetry_readings
+  │       device_last_events
+  │       events_history
+  │
+  └── 2. Broadcast via ws_manager  [real-time push]  ← NEW
+              │
+              └── all WebSocket clients watching this device
+                  receive the message instantly
+```
+
 ## What's Next
 
 | Step | Description |

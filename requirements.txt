@@ -12,6 +12,7 @@ passlib[bcrypt]==1.7.4             # Password hashing
 # ─── Database ─────────────────────────────────────────────────────────────────
 sqlalchemy==2.0.30                 # ORM (SQLite for demo → swap to Postgres/Timescale)
 aiosqlite==0.20.0                  # Async SQLite driver
+asyncpg==0.29.0                   # Async Postgres driver (if switching to Postgres)
 
 # ─── Validation & Settings ────────────────────────────────────────────────────
 pydantic==2.7.1

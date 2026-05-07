@@ -45,9 +45,13 @@ Full data flow:
 
   ESP32
     ├── generator/{id}/data          → telemetry_queue  → telemetry_service → DB
+    |                                → broadcast → ws_manager.broadcast_telemetry()
+    |
     ├── generator/{id}/event/state   → event_state_queue → event_service → DB
+    |                                → broadcast → ws_manager.broadcast_event_state()
+    |
     └── generator/{id}/event/update  → event_update_queue → event_service → DB
-
+                                     → broadcast → ws_manager.broadcast_event_update()
 
 Why a separate background task instead of saving in on_message()?
 ──────────────────────────────────────────────────────────────────
@@ -67,6 +71,7 @@ from app.core.state import shared_state, DeviceState
 from app.db.database import AsyncSessionLocal
 from app.services.telemetry_service import telemetry_service
 from app.services.event_service import event_service
+from app.services.ws_manager import ws_manager 
 
 class DataRouter:
     """
@@ -232,17 +237,25 @@ class DataRouter:
                 await asyncio.sleep(1)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # DB Persistence Methods
+    # DB Persistence Methods + Broadcast Methods
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _save_telemetry(self, device_id: str, payload: Dict[str, Any]) -> None:
-        """Save telemetry reading → telemetry_readings table."""
+        """Save telemetry reading → telemetry_readings table. Then broadcast to WebSocket clients."""
         try:
             async with AsyncSessionLocal() as session:
                 await telemetry_service.save_reading(
                     db=session, device_id=device_id, payload=payload
                 )
                 await session.commit()
+            # Broadcast to all WebSocket clients watching this device
+            # Only broadcast if there are clients (avoid unnecessary work)
+            if ws_manager.get_connection_count(device_id) > 0:
+                await ws_manager.broadcast_telemetry(device_id, payload)
+                logger.debug(
+                    f"[DataRouter] Telemetry broadcast — device={device_id} "
+                    f"clients={ws_manager.get_connection_count(device_id)}"
+                )
         except Exception as exc:
             logger.error(f"[DataRouter] Telemetry DB save failed {device_id}: {exc}")
 
@@ -251,6 +264,8 @@ class DataRouter:
         Process full event state dump → device_last_events + events_history.
 
         Payload format: {"low_oil_pressure": false, "high_temp": true, ...}
+
+            Save to DB then broadcast to WebSocket clients.
         """
         try:
             async with AsyncSessionLocal() as session:
@@ -258,6 +273,8 @@ class DataRouter:
                     db=session, device_id=device_id, payload=payload
                 )
                 await session.commit()
+            if ws_manager.get_connection_count(device_id) > 0:
+                await ws_manager.broadcast_event_state(device_id, payload)
         except Exception as exc:
             logger.error(f"[DataRouter] Event state save failed {device_id}: {exc}")
 
@@ -266,6 +283,8 @@ class DataRouter:
         Process single event update → device_last_events + events_history.
 
         Payload format: {"event": "fuel_low", "value": true}
+
+        then broadcast to WebSocket clients watching this device.
         """
         try:
             event_name = payload.get("event")
@@ -291,6 +310,10 @@ class DataRouter:
                     new_value=value,
                 )
                 await session.commit()
+            
+            # Broadcast the single event change to WebSocket clients
+            if ws_manager.get_connection_count(device_id) > 0:
+                await ws_manager.broadcast_event_update(device_id, event_name, value)
 
         except Exception as exc:
             logger.error(f"[DataRouter] Event update save failed {device_id}: {exc}")

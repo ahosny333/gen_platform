@@ -33,7 +33,7 @@ class LoginRequest(BaseModel):
     Frontend sends:
         POST /api/auth/login
         {
-            "email": "admin@generator.local",
+            "email": "admin@gmail.com",
             "password": "admin123"
         }
 
@@ -44,7 +44,7 @@ class LoginRequest(BaseModel):
     """
     email: EmailStr = Field(
         ...,                              # ... means required
-        example="admin@generator.local",
+        example="admin@gmail.com",
     )
     password: str = Field(
         ...,
