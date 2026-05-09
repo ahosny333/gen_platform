@@ -21,6 +21,36 @@ Option B (future Redis upgrade) — Cross-process broadcast:
   all workers receive it → each broadcasts to its own local clients.
   The public interface (connect/disconnect/broadcast) stays IDENTICAL.
 
+What changed from Option A:
+  _broadcast_local()  → now publishes to Redis instead of looping locally
+  broadcast_to_local_clients() → NEW method, called by redis_subscriber
+                                  to deliver to THIS worker's local clients
+
+What stayed exactly the same:
+  connect(), disconnect()          → identical
+  broadcast_telemetry()            → identical public interface
+  broadcast_event_update()         → identical public interface
+  broadcast_event_state()          → identical public interface
+  get_connection_count()           → identical
+  get_all_stats()                  → identical
+
+Full multi-worker flow:
+  data_router calls broadcast_telemetry(device_id, payload)
+        ↓
+  ws_manager builds message dict
+        ↓
+  _broadcast_local() → redis_manager.publish(device_id, message)
+        ↓
+  Redis delivers to ALL workers
+        ↓
+  redis_subscriber._deliver_to_local_clients() on each worker
+        ↓
+  ws_manager.broadcast_to_local_clients() on each worker
+        ↓
+  Each worker sends to its own local WebSocket connections
+
+
+
 Connection structure:
   _connections = {
       "gen_01": {
@@ -60,7 +90,7 @@ class WebSocketManager:
     """
 
     def __init__(self) -> None:
-        # device_id → set of active WebSocket connections
+        # device_id → set of active WebSocket connections ON THIS WORKER
         self._connections: Dict[str, Set[WebSocket]] = {}
         # Lock per device to prevent concurrent modification during broadcast
         self._locks: Dict[str, asyncio.Lock] = {}
@@ -115,6 +145,7 @@ class WebSocketManager:
 
     # ══════════════════════════════════════════════════════════════════════════
     # Broadcasting
+    # Now publish to Redis instead of looping locally
     # ══════════════════════════════════════════════════════════════════════════
 
     async def broadcast_telemetry(
@@ -124,6 +155,7 @@ class WebSocketManager:
     ) -> None:
         """
         Broadcast a telemetry reading to all clients watching this device.
+        updated : Broadcast telemetry → Redis → all workers → their local clients.
 
         Frontend receives:
         {
@@ -143,7 +175,8 @@ class WebSocketManager:
             "device_id": device_id,
             "data": payload,
         }
-        await self._broadcast_local(device_id, message)
+        # await self._broadcast_local(device_id, message)
+        await self._broadcast_via_redis(device_id, message)
 
     async def broadcast_event_update(
         self,
@@ -153,6 +186,7 @@ class WebSocketManager:
     ) -> None:
         """
         Broadcast a single event change to all clients watching this device.
+        update : Broadcast single event change → Redis → all workers. 
 
         Frontend receives:
         {
@@ -172,7 +206,8 @@ class WebSocketManager:
                 "value": value,
             },
         }
-        await self._broadcast_local(device_id, message)
+        # await self._broadcast_local(device_id, message)
+        await self._broadcast_via_redis(device_id, message)
 
     async def broadcast_event_state(
         self,
@@ -182,6 +217,7 @@ class WebSocketManager:
         """
         Broadcast a full event state snapshot to all clients watching this device.
         Sent when ESP32 publishes a full state dump.
+        update : Broadcast full event state dump → Redis → all workers
 
         Frontend receives:
         {
@@ -199,18 +235,60 @@ class WebSocketManager:
             "device_id": device_id,
             "data": events,
         }
-        await self._broadcast_local(device_id, message)
+        # await self._broadcast_local(device_id, message)
+        await self._broadcast_via_redis(device_id, message)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # NEW: Deliver to THIS worker's local clients
+    # Called by redis_subscriber after receiving from Redis
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def broadcast_to_local_clients(
+        self,
+        device_id: str,
+        message: Dict[str, Any],
+    ) -> None:
+        """
+        Send a message to all WebSocket clients connected to THIS worker.
+
+        This is called by redis_subscriber — NOT by data_router.
+        data_router → Redis → redis_subscriber → this method
+
+        If called directly without going through Redis,
+        only this worker's clients would receive it (wrong behavior).
+        """
+        if device_id not in self._connections:
+            return
+        if not self._connections[device_id]:
+            return
+
+        async with self._locks[device_id]:
+            message_str = json.dumps(message, default=str)
+            clients_snapshot = set(self._connections[device_id])
+            dead_clients = set()
+
+            for websocket in clients_snapshot:
+                success = await self._send_to_client(
+                    websocket, message_str, pre_serialized=True
+                )
+                if not success:
+                    dead_clients.add(websocket)
+
+            for dead in dead_clients:
+                self._connections[device_id].discard(dead)
+                logger.debug(f"[WSManager] Removed dead connection for {device_id}")
+
 
     # ══════════════════════════════════════════════════════════════════════════
     # Stats & Health
     # ══════════════════════════════════════════════════════════════════════════
 
     def get_connection_count(self, device_id: str) -> int:
-        """Return number of active WebSocket clients for a device."""
+        """Return number of active WebSocket clients for a device on THIS worker."""
         return len(self._connections.get(device_id, set()))
 
     def get_all_stats(self) -> Dict[str, int]:
-        """Return client count per device — used in /health endpoint."""
+        """Return client count per device — used in /health endpoint on THIS worker."""
         return {
             device_id: len(clients)
             for device_id, clients in self._connections.items()
@@ -220,50 +298,73 @@ class WebSocketManager:
         """Total active WebSocket connections across all devices."""
         return sum(len(c) for c in self._connections.values())
 
+    # # ══════════════════════════════════════════════════════════════════════════
+    # # Internal Broadcast — THIS METHOD SWAPS FOR REDIS IN OPTION B
+    # # ══════════════════════════════════════════════════════════════════════════
+
+    # async def _broadcast_local(
+    #     self,
+    #     device_id: str,
+    #     message: Dict[str, Any],
+    # ) -> None:
+    #     """
+    #     Send message to all local WebSocket clients for a device.
+
+    #     OPTION A — local in-process broadcast (current implementation)
+    #     OPTION B — replace this with: await redis.publish(f"device:{device_id}", json.dumps(message))
+    #                Then add a Redis subscriber loop that calls _send_to_local_clients()
+
+    #     Uses a lock per device to prevent:
+    #       - Concurrent modification of the connections set
+    #       - Race conditions when a client disconnects mid-broadcast
+    #     """
+    #     if device_id not in self._connections:
+    #         return  # No clients watching this device
+
+    #     if not self._connections[device_id]:
+    #         return  # Empty set
+
+    #     async with self._locks[device_id]:
+    #         message_str = json.dumps(message, default=str)
+
+    #         # Copy set to avoid "set changed size during iteration" error
+    #         # if a client disconnects exactly during broadcast
+    #         clients_snapshot = set(self._connections[device_id])
+
+    #         dead_clients = set()
+
+    #         for websocket in clients_snapshot:
+    #             success = await self._send_to_client(websocket, message_str, pre_serialized=True)
+    #             if not success:
+    #                 dead_clients.add(websocket)
+
+    #         # Clean up any dead connections found during broadcast
+    #         for dead in dead_clients:
+    #             self._connections[device_id].discard(dead)
+    #             logger.debug(f"[WSManager] Removed dead connection for {device_id}")
+
+
     # ══════════════════════════════════════════════════════════════════════════
-    # Internal Broadcast — THIS METHOD SWAPS FOR REDIS IN OPTION B
+    # Internal — publish to Redis (replaces _broadcast_local from Option A)
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def _broadcast_local(
+    async def _broadcast_via_redis(
         self,
         device_id: str,
         message: Dict[str, Any],
     ) -> None:
         """
-        Send message to all local WebSocket clients for a device.
+        Publish message to Redis channel for cross-worker delivery.
 
-        OPTION A — local in-process broadcast (current implementation)
-        OPTION B — replace this with: await redis.publish(f"device:{device_id}", json.dumps(message))
-                   Then add a Redis subscriber loop that calls _send_to_local_clients()
+        This replaced _broadcast_local() from Option A.
+        Instead of looping through local connections, we publish once to Redis.
+        Redis then delivers to ALL workers, each delivering to its own clients.
 
-        Uses a lock per device to prevent:
-          - Concurrent modification of the connections set
-          - Race conditions when a client disconnects mid-broadcast
+        Import is done inside method to avoid circular imports at module load.
+        (ws_manager ← redis_manager ← config — no circular dependency)
         """
-        if device_id not in self._connections:
-            return  # No clients watching this device
-
-        if not self._connections[device_id]:
-            return  # Empty set
-
-        async with self._locks[device_id]:
-            message_str = json.dumps(message, default=str)
-
-            # Copy set to avoid "set changed size during iteration" error
-            # if a client disconnects exactly during broadcast
-            clients_snapshot = set(self._connections[device_id])
-
-            dead_clients = set()
-
-            for websocket in clients_snapshot:
-                success = await self._send_to_client(websocket, message_str, pre_serialized=True)
-                if not success:
-                    dead_clients.add(websocket)
-
-            # Clean up any dead connections found during broadcast
-            for dead in dead_clients:
-                self._connections[device_id].discard(dead)
-                logger.debug(f"[WSManager] Removed dead connection for {device_id}")
+        from app.services.redis_manager import redis_manager
+        await redis_manager.publish(device_id, message)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Send to Single Client

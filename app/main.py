@@ -4,21 +4,33 @@ app/main.py
 FastAPI Application Entry Point
 ═══════════════════════════════════════════════════════════════════════════════
 
-Startup sequence:
-  1. FastAPI app is created with lifespan context manager
-  2. On startup:  MQTT service connects + background loop starts
-  3. Data router starts (queue → database background task)
-  4. Routes are registered (auth, devices, websocket, health)
-  5. Uvicorn serves the app
-  6. On shutdown: MQTT service disconnects cleanly
+This process handles ONLY:
+  - REST API requests
+  - WebSocket connections
+  - Redis subscriber (receive from MQTT worker, push to WebSocket clients)
 
-The lifespan pattern (replacing deprecated @app.on_event) is the
-FastAPI-recommended approach for managing background services.
+This process does NOT:
+  - Connect to MQTT broker  (that's mqtt_worker.py)
+  - Write telemetry to DB   (that's mqtt_worker.py)
+  - Run the data router     (that's mqtt_worker.py)
 
-Services started at startup:
-  1. Database   → create tables + seed default data
-  2. MQTT       → connect broker, subscribe to all topics
-  3. DataRouter → background workers: queue → DB → WebSocket broadcast
+Startup per API worker:
+  1. Redis publisher  → for publishing commands (Step 5)
+  2. Redis subscriber → receive device data → push to local WS clients
+
+Run modes:
+  Development:  uvicorn app.main:app --reload
+  Production:   gunicorn app.main:app --workers 4 -k uvicorn.workers.UvicornWorker
+                OR: bash run.sh --api
+
+Complete system requires TWO terminal/service windows:
+  Terminal 1: python -m app.mqtt_worker    ← handles MQTT + DB writes
+  Terminal 2: bash run.sh --api            ← handles HTTP + WebSocket
+
+Multi-worker production startup:
+  gunicorn -k uvicorn.workers.UvicornWorker app.main:app --workers 4
+  OR
+  uvicorn app.main:app --workers 4
 
 Route map:
   POST   /api/auth/login                        public
@@ -32,7 +44,7 @@ Route map:
   WS     /ws/{device_id}?token=JWT              all authenticated users
 ═══════════════════════════════════════════════════════════════════════════════
 """
-
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -41,10 +53,12 @@ from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
 from app.core.logging import logger
-from app.core.state import shared_state
-from app.services.mqtt_service import mqtt_service
-from app.services.data_router import data_router
+#from app.core.state import shared_state
+#from app.services.mqtt_service import mqtt_service
+#from app.services.data_router import data_router
 from app.services.ws_manager import ws_manager
+from app.services.redis_manager import redis_manager
+from app.services.redis_subscriber import redis_subscriber
 from app.db.init_db import init_db
 settings = get_settings()
 
@@ -60,34 +74,37 @@ async def lifespan(app: FastAPI):
     Code before `yield` runs on startup.
     Code after `yield` runs on shutdown.
     """
-    # ── Startup ───────────────────────────────────────────────────────────────
+    pid = os.getpid()
     logger.info("=" * 60)
-    logger.info(f"  {settings.app_name} v{settings.app_version}")
-    logger.info(f"  Debug mode: {settings.debug}")
+    logger.info(f"  {settings.app_name} — API Worker")
+    logger.info(f"  Version: {settings.app_version}")
+    logger.info(f"  PID: {pid}")
     logger.info("=" * 60)
 
-    # Initialize database — create tables + seed admin user
-    await init_db()                                   # ← NEW
-    
-    # Start MQTT service (connects broker, starts background thread)
-    mqtt_service.start()
+    # ── 1. Redis Publisher ───────────────────────────────────────────────────
+    # Used by:
+    #   - redis_subscriber to publish commands (Step 5)
+    #   - health check to verify Redis connectivity
+    logger.info(f"[API] Connecting to Redis...")
+    await redis_manager.connect()
 
-    # 3. Start data router — async background task that reads from
-    #    shared_state queues and saves each reading to the database
-    #    THIS IS THE FIX — connects MQTT pipeline to the database
-    await data_router.start()                                 
+    # ── 2. Redis Subscriber ──────────────────────────────────────────────────
+    # Listens on Redis channels for device data published by mqtt_worker.
+    # Delivers received messages to THIS worker's local WebSocket clients.
+    logger.info(f"[API] Starting Redis subscriber...")
+    await redis_subscriber.start()
 
-    logger.info("[App] Application startup complete. Ready to serve requests.")
+    logger.info(f"[API] Worker PID={pid} ready")
+    logger.info(f"[API] Docs:      http://localhost:8000/docs")
+    logger.info(f"[API] WebSocket: ws://localhost:8000/ws/{{device_id}}?token=JWT")
+    logger.info(f"[API] MQTT worker must also be running separately")
 
-    yield  # ← Application runs here
+    yield
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
-    logger.info("[App] Shutting down...")
-    # Stop data router first — let it finish any in-progress DB writes
-    await data_router.stop()   
-    # Then stop MQTT — no new data after this point
-    mqtt_service.stop()
-    logger.info("[App] Shutdown complete.")
+    logger.info(f"[API] Worker PID={pid} shutting down...")
+    await redis_subscriber.stop()
+    await redis_manager.disconnect()
+    logger.info(f"[API] Worker PID={pid} shutdown complete")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -130,18 +147,18 @@ app.add_middleware(
 @app.get("/health", tags=["System"], summary="Platform health check")
 async def health_check():
     """
-    Returns platform status including:
-    - MQTT broker connection status
-    - Active device count and their live data state
-    - WebSocket client count per device
+    Returns status of this API worker process.
+    Note: mqtt_connected will always be False here (MQTT runs in mqtt_worker).
+    Check mqtt_worker logs for MQTT connection status.
     """
+    redis_info = await redis_manager.get_info()
     return JSONResponse({
         "status": "ok",
+        "process": "api_worker",
         "version": settings.app_version,
-        "mqtt_connected": mqtt_service.is_connected,
-        "data_router_running": data_router._running,
-        "websocket_connections": ws_manager.get_all_stats(),
-        "devices": shared_state.summary(),
+        "pid": os.getpid(),
+        "redis": redis_info,
+        "websocket_local_connections": ws_manager.get_all_stats(),
     })
 
 

@@ -44,9 +44,15 @@ class Settings(BaseSettings):
     # ── Database ───────────────────────────────────────────────────────────────
     database_url: str = "sqlite+aiosqlite:///./generator_platform.db"
 
+    # ── Redis ──────────────────────────────────────────────────────────────────
+    redis_url: str = "redis://localhost:6379/0"
+    # Channel prefix — full channel = "device:gen_01"
+    redis_channel_prefix: str = "device"
+
     # ── Server ─────────────────────────────────────────────────────────────────
     host: str = "0.0.0.0"
     port: int = 8000
+    workers: int = 4           # Number of Uvicorn worker processes
 
     # ── CORS ───────────────────────────────────────────────────────────────────
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
@@ -59,6 +65,10 @@ class Settings(BaseSettings):
     def get_command_topic(self, device_id: str) -> str:
         """Return the MQTT publish topic for a given device."""
         return self.mqtt_command_topic_template.format(device_id=device_id)
+
+    def get_redis_channel(self, device_id: str) -> str:
+        """Redis pub/sub channel name for a device."""
+        return f"{self.redis_channel_prefix}:{device_id}"
 
 
 @lru_cache

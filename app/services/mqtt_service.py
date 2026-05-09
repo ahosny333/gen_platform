@@ -1,17 +1,20 @@
 """
 app/services/mqtt_service.py
 ─────────────────────────────
-MQTT Background Service
+MQTT Service — Runs ONLY in mqtt_worker.py
 ═══════════════════════════════════════════════════════════════════════════════
 
-Responsibilities:
-  1. Connect to the MQTT broker at startup
-  2. 
-    Now subscribes to 3 topic patterns:
+IMPORTANT: This service now runs in ONLY ONE process (mqtt_worker.py).
+           No PID suffix on client_id — clean single connection.
 
-    generator/+/data           → telemetry readings (sensor data)
-    generator/+/event/state    → full event state dump (all events)
-    generator/+/event/update   → single event change
+Two responsibilities:
+  1. SUBSCRIBE — receive data from ESP32 devices, push to shared_state queues
+  2. PUBLISH   — send commands to devices (called via Redis from API workers)
+
+Topics subscribed (receiving from ESP32):
+  generator/+/data           → telemetry readings
+  generator/+/event/state    → full event state dump
+  generator/+/event/update   → single event change
 
     on_message() routes each message to the correct shared_state method
     based on the topic pattern it matched.
@@ -25,9 +28,19 @@ Threading model:
   thread — heavy work (DB writes) happens in FastAPI's async context via
   the asyncio queue.
 
-Topic convention (matches ESP32 firmware):
-  ESP32  →  Backend :  generator/{device_id}/data
-  Backend → ESP32  :  generator/{device_id}/command
+Topic published (sending commands to ESP32):
+  generator/{device_id}/command
+
+Command flow for multi-process architecture:
+  API Worker receives POST /api/devices/{id}/command
+        ↓
+  API Worker publishes command to Redis channel "cmd:{device_id}"
+        ↓
+  mqtt_worker's CommandListener receives from Redis
+        ↓
+  mqtt_service.publish() sends to ESP32 via MQTT
+        ↓
+  ESP32 executes command
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -62,8 +75,8 @@ class MQTTService:
 
     def start(self) -> None:
         """
-        Initialize and connect the MQTT client.
-        Called from FastAPI lifespan on startup.
+        Connect to MQTT broker with a single clean client ID.
+        No PID suffix needed — only ONE process runs this.
         """
         logger.info("[MQTT] Starting MQTT service...")
         self._client = mqtt.Client(
@@ -107,7 +120,6 @@ class MQTTService:
     def stop(self) -> None:
         """
         Gracefully disconnect and stop the MQTT loop.
-        Called from FastAPI lifespan on shutdown.
         """
         logger.info("[MQTT] Stopping MQTT service...")
         if self._client:
@@ -118,7 +130,8 @@ class MQTTService:
     def publish(self, device_id: str, payload: Dict[str, Any]) -> bool:
         """
         Publish a command payload to a device.
-        Called by the Control API route (REST → MQTT → Device).
+        Called by CommandListener in mqtt_worker.py after receiving
+        a command request from an API worker via Redis.
 
         Args:
             device_id: Target device identifier
@@ -229,6 +242,7 @@ class MQTTService:
     ) -> None:
         """
         Fired for every incoming MQTT message.
+        Route incoming MQTT message to correct shared_state queue.
         Runs in the MQTT background thread — MUST be fast and non-blocking.
 
         Flow:

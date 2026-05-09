@@ -21,3 +21,9 @@ pydantic-settings==2.2.1           # .env config management
 # ─── Utilities ────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 python-multipart==0.0.9            # Form data support
+
+# ─── Redis ─────────────────────────────────────────────────────────────────────
+redis[hiredis]==5.0.4              # Async Redis client (hiredis = faster parser)
+
+# ─── Production Server ─────────────────────────────────────────────────────────
+gunicorn==22.0.0                   # Production WSGI/ASGI server (multi-worker)

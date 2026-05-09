@@ -23,10 +23,14 @@ Full data flow after this fix:
      │  → reads from asyncio.Queue
      │  → calls telemetry_service.save_reading()
      ▼
-  Database (SQLite / PostgreSQL)
-     │
-     ▼
-  REST API /history  serves data to frontend charts
+        ↓
+  redis_manager.publish()           → Redis channel "device:gen_01"
+        ↓
+  API workers receive from Redis
+        ↓
+  ws_manager.broadcast_to_local_clients()
+        ↓
+  WebSocket clients in browser
 
 Background Data Router — All Queues → Database
 ═══════════════════════════════════════════════════════════════════════════════
@@ -61,6 +65,11 @@ Why a separate background task instead of saving in on_message()?
   Solution: on_message() puts data in a Queue (thread-safe),
   and this async background task reads from the Queue and does the DB work.
 ═══════════════════════════════════════════════════════════════════════════════
+
+NEW: data_router calls redis_manager.publish()
+       Redis delivers to ALL API worker processes
+       Each API worker's redis_subscriber delivers to its local WS clients
+       Result: ALL connected users receive the message ✅
 """
 
 import asyncio
@@ -138,9 +147,9 @@ class DataRouter:
 
     async def _supervisor_loop(self) -> None:
         """
+        Watches shared_state for new devices and spawns workers automatically.
+        New device appears → 3 workers spawned (one per queue type).
         Runs every 2 seconds.
-        Checks shared_state for any device_ids that don't have a
-        worker task yet, and spawns one for each new device found.
 
         This means the system is fully dynamic:
           - First MQTT message from gen_01 → worker spawned for gen_01
@@ -218,13 +227,13 @@ class DataRouter:
                     # No data in 5 seconds — loop back and check _running
                     continue
 
-                # Route to correct service
+                # Process: DB save → Redis publish
                 if worker_type == "telemetry":
-                    await self._save_telemetry(device_id, payload)
+                    await self._process_telemetry(device_id, payload)
                 elif worker_type == "event_state":
-                    await self._save_event_state(device_id, payload)
+                    await self._process_event_state(device_id, payload)
                 else:
-                    await self._save_event_update(device_id, payload)
+                    await self._process_event_update(device_id, payload)
 
                 queue.task_done()
 
@@ -237,54 +246,90 @@ class DataRouter:
                 await asyncio.sleep(1)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # DB Persistence Methods + Broadcast Methods
+    # Processing Methods — DB save then Redis publish
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def _save_telemetry(self, device_id: str, payload: Dict[str, Any]) -> None:
-        """Save telemetry reading → telemetry_readings table. Then broadcast to WebSocket clients."""
+    async def _process_telemetry(
+        self,
+        device_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """
+        1. Save telemetry reading to telemetry_readings table
+        2. Update device.last_reading snapshot
+        3. Publish to Redis → API workers push to WebSocket clients
+        """
         try:
+            # ── Save to DB ────────────────────────────────────────────────────
             async with AsyncSessionLocal() as session:
                 await telemetry_service.save_reading(
-                    db=session, device_id=device_id, payload=payload
+                    db=session,
+                    device_id=device_id,
+                    payload=payload,
                 )
                 await session.commit()
-            # Broadcast to all WebSocket clients watching this device
-            # Only broadcast if there are clients (avoid unnecessary work)
-            if ws_manager.get_connection_count(device_id) > 0:
-                await ws_manager.broadcast_telemetry(device_id, payload)
-                logger.debug(
-                    f"[DataRouter] Telemetry broadcast — device={device_id} "
-                    f"clients={ws_manager.get_connection_count(device_id)}"
-                )
+
+            logger.debug(
+                f"[DataRouter] Telemetry saved — device={device_id} "
+                f"status={payload.get('status')}"
+            )
+
+            # ── Publish to Redis ───────────────────────────────────────────────
+            # Build the exact message format that WebSocket clients expect
+            message = {
+                "type": "telemetry",
+                "device_id": device_id,
+                "data": payload,
+            }
+            await self._publish_to_redis(device_id, message)
+
         except Exception as exc:
-            logger.error(f"[DataRouter] Telemetry DB save failed {device_id}: {exc}")
+            logger.error(
+                f"[DataRouter] Telemetry processing failed "
+                f"device={device_id}: {exc}"
+            )
 
-    async def _save_event_state(self, device_id: str, payload: Dict[str, Any]) -> None:
+    async def _process_event_state(
+        self,
+        device_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
         """
-        Process full event state dump → device_last_events + events_history.
-
-        Payload format: {"low_oil_pressure": false, "high_temp": true, ...}
-
-            Save to DB then broadcast to WebSocket clients.
+        1. Upsert all events in device_last_events
+        2. Log changes to events_history
+        3. Publish to Redis → API workers push to WebSocket clients
         """
         try:
             async with AsyncSessionLocal() as session:
                 await event_service.process_full_state(
-                    db=session, device_id=device_id, payload=payload
+                    db=session,
+                    device_id=device_id,
+                    payload=payload,
                 )
                 await session.commit()
-            if ws_manager.get_connection_count(device_id) > 0:
-                await ws_manager.broadcast_event_state(device_id, payload)
+
+            message = {
+                "type": "event_state",
+                "device_id": device_id,
+                "data": payload,
+            }
+            await self._publish_to_redis(device_id, message)
+
         except Exception as exc:
-            logger.error(f"[DataRouter] Event state save failed {device_id}: {exc}")
+            logger.error(
+                f"[DataRouter] Event state processing failed "
+                f"device={device_id}: {exc}"
+            )
 
-    async def _save_event_update(self, device_id: str, payload: Dict[str, Any]) -> None:
+    async def _process_event_update(
+        self,
+        device_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
         """
-        Process single event update → device_last_events + events_history.
-
-        Payload format: {"event": "fuel_low", "value": true}
-
-        then broadcast to WebSocket clients watching this device.
+        1. Upsert single event in device_last_events
+        2. Insert into events_history (always — this is a real change)
+        3. Publish to Redis → API workers push to WebSocket clients
         """
         try:
             event_name = payload.get("event")
@@ -292,13 +337,15 @@ class DataRouter:
 
             if event_name is None or value is None:
                 logger.warning(
-                    f"[DataRouter] Invalid event/update payload for {device_id}: {payload}"
+                    f"[DataRouter] Invalid event/update payload "
+                    f"device={device_id}: {payload}"
                 )
                 return
 
             if not isinstance(value, bool):
                 logger.warning(
-                    f"[DataRouter] event/update value must be bool, got {type(value)} — {device_id}"
+                    f"[DataRouter] event/update value must be bool, "
+                    f"got {type(value).__name__} — device={device_id}"
                 )
                 return
 
@@ -310,16 +357,146 @@ class DataRouter:
                     new_value=value,
                 )
                 await session.commit()
-            
-            # Broadcast the single event change to WebSocket clients
-            if ws_manager.get_connection_count(device_id) > 0:
-                await ws_manager.broadcast_event_update(device_id, event_name, value)
+
+            message = {
+                "type": "event_update",
+                "device_id": device_id,
+                "data": {
+                    "event_name": event_name,
+                    "value": value,
+                },
+            }
+            await self._publish_to_redis(device_id, message)
 
         except Exception as exc:
-            logger.error(f"[DataRouter] Event update save failed {device_id}: {exc}")
+            logger.error(
+                f"[DataRouter] Event update processing failed "
+                f"device={device_id}: {exc}"
+            )
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Redis Publish Helper
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _publish_to_redis(
+        self,
+        device_id: str,
+        message: Dict[str, Any],
+    ) -> None:
+        """
+        Publish a message to Redis pub/sub channel for this device.
+
+        Import inside method to avoid circular imports at module load time.
+        (data_router → redis_manager → config — no circular dependency)
+
+        The message will be received by redis_subscriber in ALL API workers,
+        which then deliver it to their local WebSocket clients.
+        """
+        try:
+            from app.services.redis_manager import redis_manager
+            receivers = await redis_manager.publish(device_id, message)
+            logger.debug(
+                f"[DataRouter] Published to Redis — "
+                f"device={device_id} type={message.get('type')} "
+                f"api_workers_notified={receivers}"
+            )
+        except Exception as exc:
+            logger.error(
+                f"[DataRouter] Redis publish failed "
+                f"device={device_id}: {exc}"
+            )
+            # Don't re-raise — a Redis failure should not stop DB saves
 
 
 # ── Singleton ──────────────────────────────────────────────────────────────────
-# Imported by main.py lifespan
 data_router = DataRouter()
+
+
+
+#     # ══════════════════════════════════════════════════════════════════════════
+#     # DB Persistence Methods + Broadcast Methods
+#     # ══════════════════════════════════════════════════════════════════════════
+
+#     async def _save_telemetry(self, device_id: str, payload: Dict[str, Any]) -> None:
+#         """Save telemetry reading → telemetry_readings table. Then broadcast to WebSocket clients."""
+#         try:
+#             async with AsyncSessionLocal() as session:
+#                 await telemetry_service.save_reading(
+#                     db=session, device_id=device_id, payload=payload
+#                 )
+#                 await session.commit()
+#             # Broadcast to all WebSocket clients watching this device
+#             # Only broadcast if there are clients (avoid unnecessary work)
+#             if ws_manager.get_connection_count(device_id) > 0:
+#                 await ws_manager.broadcast_telemetry(device_id, payload)
+#                 logger.debug(
+#                     f"[DataRouter] Telemetry broadcast — device={device_id} "
+#                     f"clients={ws_manager.get_connection_count(device_id)}"
+#                 )
+#         except Exception as exc:
+#             logger.error(f"[DataRouter] Telemetry DB save failed {device_id}: {exc}")
+
+#     async def _save_event_state(self, device_id: str, payload: Dict[str, Any]) -> None:
+#         """
+#         Process full event state dump → device_last_events + events_history.
+
+#         Payload format: {"low_oil_pressure": false, "high_temp": true, ...}
+
+#             Save to DB then broadcast to WebSocket clients.
+#         """
+#         try:
+#             async with AsyncSessionLocal() as session:
+#                 await event_service.process_full_state(
+#                     db=session, device_id=device_id, payload=payload
+#                 )
+#                 await session.commit()
+#             if ws_manager.get_connection_count(device_id) > 0:
+#                 await ws_manager.broadcast_event_state(device_id, payload)
+#         except Exception as exc:
+#             logger.error(f"[DataRouter] Event state save failed {device_id}: {exc}")
+
+#     async def _save_event_update(self, device_id: str, payload: Dict[str, Any]) -> None:
+#         """
+#         Process single event update → device_last_events + events_history.
+
+#         Payload format: {"event": "fuel_low", "value": true}
+
+#         then broadcast to WebSocket clients watching this device.
+#         """
+#         try:
+#             event_name = payload.get("event")
+#             value = payload.get("value")
+
+#             if event_name is None or value is None:
+#                 logger.warning(
+#                     f"[DataRouter] Invalid event/update payload for {device_id}: {payload}"
+#                 )
+#                 return
+
+#             if not isinstance(value, bool):
+#                 logger.warning(
+#                     f"[DataRouter] event/update value must be bool, got {type(value)} — {device_id}"
+#                 )
+#                 return
+
+#             async with AsyncSessionLocal() as session:
+#                 await event_service.process_single_update(
+#                     db=session,
+#                     device_id=device_id,
+#                     event_name=event_name,
+#                     new_value=value,
+#                 )
+#                 await session.commit()
+            
+#             # Broadcast the single event change to WebSocket clients
+#             if ws_manager.get_connection_count(device_id) > 0:
+#                 await ws_manager.broadcast_event_update(device_id, event_name, value)
+
+#         except Exception as exc:
+#             logger.error(f"[DataRouter] Event update save failed {device_id}: {exc}")
+
+
+
+# # ── Singleton ──────────────────────────────────────────────────────────────────
+# # Imported by main.py lifespan
+# data_router = DataRouter()
