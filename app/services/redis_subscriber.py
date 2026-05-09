@@ -160,16 +160,18 @@ class RedisSubscriber:
             logger.warning(f"[RedisSubscriber] Message missing device_id: {message}")
             return
 
-        # Only deliver if this worker has clients for this device
-        # (avoids unnecessary work on workers with no clients)
         local_count = ws_manager.get_connection_count(device_id)
-        if local_count == 0:
-            return
 
-        logger.debug(
-            f"[RedisSubscriber] Delivering {msg_type} for {device_id} "
-            f"to {local_count} local client(s)"
+        # Always log at INFO so we can confirm messages arrive even without WS clients
+        logger.info(
+            f"[RedisSubscriber] ← Redis message received — "
+            f"device={device_id} type={msg_type} "
+            f"local_ws_clients={local_count}"
         )
+
+        if local_count == 0:
+            # No WebSocket clients on this worker for this device — nothing to send
+            return
 
         # Send directly to local clients — bypass Redis publish
         await ws_manager.broadcast_to_local_clients(device_id, message)

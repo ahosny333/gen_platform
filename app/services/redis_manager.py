@@ -30,7 +30,7 @@ Channel naming convention:
   The "type" field inside the JSON message distinguishes telemetry vs events.
 ═══════════════════════════════════════════════════════════════════════════════
 """
-
+import asyncio
 import json
 from typing import Any, Dict, AsyncIterator
 
@@ -153,15 +153,17 @@ class RedisManager:
 
         This is a generator — yields one message dict at a time forever.
 
-        Usage:
-            async for message in redis_manager.subscribe_to_all_devices(sub):
-                device_id = message["device_id"]
-                await ws_manager.broadcast_to_local_clients(device_id, message)
+        Implementation note — why get_message() instead of pubsub.listen():
+          pubsub.listen() is an async generator that can silently stall
+          on Linux with multi-worker uvicorn because it holds the event loop
+          without yielding between iterations.
 
-        Why pattern subscribe instead of individual channels?
-          New devices appear dynamically (first MQTT message).
-          Pattern subscribe catches all of them automatically.
-          No need to re-subscribe when a new device appears.
+          get_message(timeout=0) is non-blocking — it checks for a message
+          and immediately returns None if none is available. We then
+          await asyncio.sleep(0.01) which yields control back to the event
+          loop, allowing other coroutines (WebSocket handlers, REST requests)
+          to run. This is the correct production pattern for Redis pub/sub
+          in asyncio applications.
         """
         pubsub = subscriber.pubsub()
         pattern = f"{settings.redis_channel_prefix}:*"
@@ -170,9 +172,21 @@ class RedisManager:
         logger.info(f"[Redis] Subscribed to pattern: {pattern}")
 
         try:
-            async for raw_message in pubsub.listen():
-                # psubscribe sends a confirmation message first — skip it
-                if raw_message["type"] != "pmessage":
+            while True:
+                # Non-blocking check — returns None immediately if no message
+                raw_message = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=0.1,  # wait up to 100ms for a message
+                )
+
+                if raw_message is None:
+                    # No message yet — yield control to event loop briefly
+                    await asyncio.sleep(0.01)
+                    continue
+
+                # Only process pattern-match messages
+                if raw_message.get("type") != "pmessage":
+                    await asyncio.sleep(0.01)
                     continue
 
                 try:
@@ -182,11 +196,17 @@ class RedisManager:
                     logger.warning(f"[Redis] Failed to parse message: {exc}")
                     continue
 
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
             logger.error(f"[Redis] Subscriber error: {exc}")
+            raise
         finally:
-            await pubsub.punsubscribe(pattern)
-            await pubsub.aclose()
+            try:
+                await pubsub.punsubscribe(pattern)
+                await pubsub.aclose()
+            except Exception:
+                pass
 
     # ══════════════════════════════════════════════════════════════════════════
     # Health
